@@ -110,6 +110,7 @@ static std::string slurp(const fs::path & p) {
 }
 
 struct script_turn { std::string role, content; int max_tokens = 300; };
+struct turn_timing { size_t turn, prompt_tokens, decode_tokens; double prompt_seconds, decode_seconds; };
 
 static std::vector<script_turn> read_script(const fs::path & path) {
     std::ifstream f(path); if (!f) throw std::runtime_error("cannot read " + path.string());
@@ -174,6 +175,7 @@ int main(int argc, char ** argv) try {
     const auto turns = read_script(script_path);
     std::string pending;
     size_t generated = 0; double decode_seconds = 0;
+    std::vector<turn_timing> turn_timings;
     for (size_t ti = 0; ti < turns.size(); ++ti) {
         const auto & st = turns[ti];
         if (st.role != "assistant") {
@@ -196,8 +198,11 @@ int main(int argc, char ** argv) try {
             pending = common_chat_templates_apply(tmpls.get(), initial).prompt;
         }
         auto prompt = common_tokenize(ctx, pending, evaluated.empty(), true);
+        auto prompt_start = std::chrono::steady_clock::now();
         eval(prompt, false, ti); pending.clear();
+        const double prompt_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - prompt_start).count();
         std::string answer;
+        const size_t generated_before = generated;
         auto start = std::chrono::steady_clock::now();
         for (int q = 0; q < st.max_tokens; ++q) {
             llama_token id = llama_sampler_sample(greedy, ctx, -1);
@@ -205,7 +210,9 @@ int main(int argc, char ** argv) try {
             if (llama_vocab_is_eog(vocab, id)) break;
             answer += common_token_to_piece(ctx, id, true);
         }
-        decode_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const double turn_decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        decode_seconds += turn_decode_seconds;
+        turn_timings.push_back({ti, prompt.size(), generated - generated_before, prompt_seconds, turn_decode_seconds});
         common_chat_msg answer_msg; answer_msg.role = "assistant"; answer_msg.content = answer;
         messages.push_back(std::move(answer_msg));
         std::fprintf(stderr, "turn %zu generated %zu total decode tokens\n", ti, generated);
@@ -237,7 +244,15 @@ int main(int argc, char ** argv) try {
     std::ofstream(tmp/"generated.txt") << common_chat_templates_apply(tmpls.get(), final_in).prompt;
     std::ofstream metrics(tmp/"metrics.json");
     metrics << "{\n  \"decode_tokens\": " << generated << ",\n  \"decode_seconds\": " << decode_seconds
-            << ",\n  \"decode_tokens_per_second\": " << generated/decode_seconds << "\n}\n"; metrics.close();
+            << ",\n  \"decode_tokens_per_second\": " << generated/decode_seconds << ",\n  \"turns\": [\n";
+    for (size_t i = 0; i < turn_timings.size(); ++i) {
+        const auto & t = turn_timings[i];
+        metrics << "    {\"turn\": " << t.turn << ", \"prompt_tokens\": " << t.prompt_tokens
+                << ", \"prompt_seconds\": " << t.prompt_seconds << ", \"decode_tokens\": " << t.decode_tokens
+                << ", \"decode_seconds\": " << t.decode_seconds << ", \"decode_tokens_per_second\": "
+                << t.decode_tokens/t.decode_seconds << "}" << (i + 1 == turn_timings.size() ? "\n" : ",\n");
+    }
+    metrics << "  ]\n}\n"; metrics.close();
     std::ofstream manifest(tmp/(capture_enabled ? "manifest.json" : "benchmark.json"));
     auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     manifest << "{\n  \"model\": \"" << params.model.path << "\",\n  \"arch\": \"qwen4exp\",\n"

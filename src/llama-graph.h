@@ -1093,7 +1093,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+              ggml_tensor * compute_ids = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1197,7 +1198,8 @@ struct llm_graph_context {
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
-                     int   il) const;
+                     int   il,
+             ggml_tensor ** cpu_ids = nullptr) const;
 
     //
     // inputs
