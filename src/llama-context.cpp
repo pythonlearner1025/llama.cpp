@@ -10,12 +10,14 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-router-log.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -143,6 +145,26 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.router_log        = false;
+
+    {
+        const char * dir = params.router_log_dir;
+        if (dir == nullptr) {
+            dir = getenv("LLAMA_ROUTER_LOG_DIR");
+        }
+        double max_gb = params.router_log_max_gb > 0.0 ? params.router_log_max_gb : 20.0;
+        if (const char * env_max = getenv("LLAMA_ROUTER_LOG_MAX_GB")) {
+            char * end = nullptr;
+            const double parsed = strtod(env_max, &end);
+            if (end != env_max && parsed > 0.0) {
+                max_gb = parsed;
+            }
+        }
+        if (dir != nullptr && dir[0] != '\0') {
+            router_log = llama_router_log_get(dir, max_gb, model);
+            cparams.router_log = true;
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -492,6 +514,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (router_log) {
+        router_log->flush();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -783,6 +808,10 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    if (router_log) {
+        router_log->drain();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1482,6 +1511,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (router_log && !router_log->capture(*this, *res, ubatch)) {
+        // Logging errors and size-cap exhaustion are non-fatal to inference.
+    }
 
     return res;
 }
@@ -2723,6 +2756,31 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
+    if (router_log) {
+        return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+            if (il >= 0) {
+                ggml_format_name(cur, "%s-%d", name, il);
+            } else {
+                ggml_set_name(cur, name);
+            }
+            if (il >= 0 && strcmp(name, "ffn_moe_logits_log") == 0) {
+                ggml_set_output(cur);
+            }
+            const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+            if (ubatch.n_tokens < 32 || full_offload) {
+                if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+                    const auto & dev_layer = model.dev_layer(il);
+                    for (const auto & backend : backends) {
+                        if (ggml_backend_get_device(backend.get()) == dev_layer &&
+                                ggml_backend_supports_op(backend.get(), cur)) {
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                        }
+                    }
+                }
+            }
+        };
+    }
+
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
@@ -3873,6 +3931,8 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.router_log_dir              =*/ nullptr,
+        /*.router_log_max_gb           =*/ 20.0,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
@@ -3890,6 +3950,32 @@ llama_context_params llama_context_default_params() {
     };
 
     return result;
+}
+
+void llama_context::router_log_request(int32_t seq_id, int64_t task_id, const char * request_id,
+                                       int32_t prompt_tokens, int64_t start_unix_ms, int64_t end_unix_ms) {
+    if (router_log) {
+        router_log->log_request(seq_id, task_id, request_id, prompt_tokens, start_unix_ms, end_unix_ms);
+    }
+}
+
+bool llama_context::router_log_enable(const char * dir, double max_gb) {
+    if (router_log || dir == nullptr || dir[0] == '\0' || !(max_gb > 0.0)) {
+        return false;
+    }
+    router_log = llama_router_log_get(dir, max_gb, model);
+    cparams.router_log = true;
+    gf_res_prev_active = nullptr;
+    sched_need_reserve = true;
+    return true;
+}
+
+void llama_context::router_log_disable() {
+    synchronize();
+    if (router_log) {
+        router_log->flush();
+        router_log.reset();
+    }
 }
 
 llama_context * llama_init_from_model(
@@ -4087,6 +4173,20 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_router_log_request(llama_context * ctx, int32_t seq_id, int64_t task_id,
+                              const char * request_id, int32_t prompt_tokens,
+                              int64_t start_unix_ms, int64_t end_unix_ms) {
+    ctx->router_log_request(seq_id, task_id, request_id, prompt_tokens, start_unix_ms, end_unix_ms);
+}
+
+bool llama_router_log_enable(llama_context * ctx, const char * dir, double max_gb) {
+    return ctx->router_log_enable(dir, max_gb);
+}
+
+void llama_router_log_disable(llama_context * ctx) {
+    ctx->router_log_disable();
 }
 
 float * llama_get_logits(llama_context * ctx) {

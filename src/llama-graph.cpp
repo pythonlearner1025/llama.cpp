@@ -2111,6 +2111,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
+        if (cparams.router_log) {
+            // Materialize a dedicated graph output. Keeping the producer
+            // tensor itself as an output is insufficient on backends that
+            // reuse its storage after the router operation; in batched
+            // prefills only the first row remained intact. Expand the copy as
+            // an independent graph output without changing the routing path.
+            // The logger converts it to the on-disk F16 representation.
+            ggml_tensor * log_logits = ggml_dup(ctx0, logits);
+            cb(log_logits, "ffn_moe_logits_log", il);
+            ggml_build_forward_expand(gf, log_logits);
+        }
     } else {
         logits = probs_in;
     }

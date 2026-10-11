@@ -1683,6 +1683,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--router-log"}, "DIR",
+        "write full per-token MoE router logits to DIR (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.router_log_dir = value;
+        }
+    ).set_env("LLAMA_ROUTER_LOG_DIR"));
+    add_opt(common_arg(
+        {"--router-log-max-gb"}, "N",
+        string_format("stop router logging at this many GB (default: %.1f)", params.router_log_max_gb),
+        [](common_params & params, const std::string & value) {
+            params.router_log_max_gb = std::stod(value);
+            if (!(params.router_log_max_gb > 0.0)) {
+                throw std::invalid_argument("router-log-max-gb must be positive");
+            }
+        }
+    ).set_env("LLAMA_ROUTER_LOG_MAX_GB"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

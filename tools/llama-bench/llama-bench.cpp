@@ -374,6 +374,8 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    std::string                      router_log_dir;
+    double                           router_log_max_gb;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -420,6 +422,8 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* router_log_dir       */ "",
+    /* router_log_max_gb    */ 20.0,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -440,6 +444,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --router-log <dir>                          write full per-token MoE router logits (default: disabled)\n");
+    printf("  --router-log-max-gb <n>                     stop router logging at n GB (default: %.1f)\n", cmd_params_defaults.router_log_max_gb);
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)\n");
     if (llama_supports_rpc()) {
@@ -539,6 +545,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.router_log_dir       = cmd_params_defaults.router_log_dir;
+    params.router_log_max_gb    = cmd_params_defaults.router_log_max_gb;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -586,6 +594,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.hf_token = argv[i];
             } else if (arg == "--offline") {
                 params.offline = true;
+            } else if (arg == "--router-log") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.router_log_dir = argv[i];
+            } else if (arg == "--router-log-max-gb") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.router_log_max_gb = std::stod(argv[i]);
+                if (!(params.router_log_max_gb > 0.0)) {
+                    invalid_param = true;
+                    break;
+                }
             } else if (arg == "-p" || arg == "--n-prompt") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2375,6 +2399,8 @@ int llama_bench(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
+        cparams.router_log_dir = params.router_log_dir.empty() ? nullptr : params.router_log_dir.c_str();
+        cparams.router_log_max_gb = params.router_log_max_gb;
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());

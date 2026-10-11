@@ -54,6 +54,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool router_log;
 
     size_t moe_cache_size;
 

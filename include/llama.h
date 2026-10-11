@@ -393,6 +393,11 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
+        // Full MoE router-log capture. Empty disables capture.
+        // LLAMA_ROUTER_LOG_DIR is used when router_log_dir is nullptr.
+        const char * router_log_dir;
+        double router_log_max_gb;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
@@ -1130,6 +1135,27 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    // Append one llama-server request record to requests.jsonl when router logging is enabled.
+    LLAMA_API void llama_router_log_request(
+            struct llama_context * ctx,
+                       int32_t   seq_id,
+                       int64_t   task_id,
+                    const char * request_id,
+                       int32_t   prompt_tokens,
+                       int64_t   start_unix_ms,
+                       int64_t   end_unix_ms);
+
+    // Enable router logging on an existing context. This is primarily useful
+    // for logging an appended prefill after an unlogged reusable base context.
+    LLAMA_API bool llama_router_log_enable(
+            struct llama_context * ctx,
+                    const char * dir,
+                         double max_gb);
+
+    // Flush and detach the current router log. The context remains prepared
+    // for a later llama_router_log_enable() call without changing inference.
+    LLAMA_API void llama_router_log_disable(struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

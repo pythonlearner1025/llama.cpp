@@ -736,6 +736,9 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // Primary source path, retained for diagnostics such as router-log manifests.
+    std::string path_model;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 

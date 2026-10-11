@@ -1263,6 +1263,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
         };
 
+        // Fitting may construct probe contexts. Router logging belongs to the
+        // real process context, not those short-lived sizing probes.
+        const char * router_log_dir = cparams.router_log_dir;
+        cparams.router_log_dir = "";
+        cparams_dft.router_log_dir = "";
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
@@ -1270,6 +1275,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        cparams.router_log_dir = router_log_dir;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1731,6 +1737,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.router_log_dir    = params.router_log_dir.empty() ? nullptr : params.router_log_dir.c_str();
+    cparams.router_log_max_gb = params.router_log_max_gb;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

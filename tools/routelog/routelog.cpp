@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -127,29 +128,255 @@ static std::vector<script_turn> read_script(const fs::path & path) {
 }
 
 int main(int argc, char ** argv) try {
-    std::string script_path, output_path; int session_id = 0; bool capture_enabled = true;
+    std::string script_path, output_path, prefill_base, prefill_append, prefill_cache, teacher_forced, teacher_script, teacher_raw;
+    std::vector<std::string> prefill_appends, prefill_outputs;
+    int session_id = 0; bool capture_enabled = true;
     std::vector<char *> pass; pass.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--benchmark-no-capture") {
             capture_enabled = false;
-        } else if ((a == "--session-script" || a == "--output" || a == "--session-id") && i + 1 < argc) {
+        } else if ((a == "--session-script" || a == "--output" || a == "--session-id" ||
+                    a == "--prefill-base" || a == "--prefill-append" || a == "--prefill-cache" ||
+                    a == "--teacher-forced" || a == "--teacher-script" || a == "--teacher-raw") && i + 1 < argc) {
             std::string v = argv[++i];
-            if (a == "--session-script") script_path = v; else if (a == "--output") output_path = v; else session_id = std::stoi(v);
+            if (a == "--session-script") script_path = v;
+            else if (a == "--output") { output_path = v; prefill_outputs.push_back(v); }
+            else if (a == "--prefill-base") prefill_base = v;
+            else if (a == "--prefill-append") { prefill_append = v; prefill_appends.push_back(v); }
+            else if (a == "--prefill-cache") prefill_cache = v;
+            else if (a == "--teacher-forced") teacher_forced = v;
+            else if (a == "--teacher-script") teacher_script = v;
+            else if (a == "--teacher-raw") teacher_raw = v;
+            else session_id = std::stoi(v);
         } else pass.push_back(argv[i]);
     }
-    if (script_path.empty() || output_path.empty()) throw std::runtime_error("--session-script and --output are required");
+    const bool prefill_only = !prefill_base.empty() || !prefill_append.empty();
+    const bool teacher_only = !teacher_forced.empty() || !teacher_script.empty() || !teacher_raw.empty();
+    if (output_path.empty() || (prefill_only && (prefill_base.empty() || prefill_appends.empty() || prefill_appends.size() != prefill_outputs.size())) ||
+            (teacher_only && teacher_raw.empty() && (teacher_forced.empty() || teacher_script.empty())) ||
+            (!prefill_only && !teacher_only && script_path.empty())) {
+        throw std::runtime_error("use --session-script, --teacher-forced with --teacher-script, or --prefill-base with --prefill-append");
+    }
 
     common_params params; common_init();
     if (!common_params_parse((int) pass.size(), pass.data(), params, LLAMA_EXAMPLE_COMMON)) return 1;
+    if (!teacher_raw.empty()) {
+        // Runtime enablement cannot retrofit logger-only graph outputs into an
+        // already-created graph object, so the forcing pass starts logged.
+        params.router_log_dir = output_path.c_str();
+    }
     params.warmup = false;
     params.n_outputs_max = 128; // observable prefill chunks; avoids reserving n_batch logits
     route_capture cap; cap.session = session_id;
+    if (prefill_only || teacher_only) capture_enabled = false;
     if (capture_enabled) { params.cb_eval = route_cb; params.cb_eval_user_data = &cap; }
     llama_backend_init(); llama_numa_init(params.numa);
     auto init = common_init_from_params(params);
     llama_model * model = init->model(); llama_context * ctx = init->context();
     if (!model || !ctx) throw std::runtime_error("model initialization failed");
+
+    if (teacher_only) {
+        cap.n_layers = llama_model_n_layer(model);
+        cap.k = 10;
+        cap.expert_layers.resize(cap.n_layers);
+        cap.gate_layers.resize(cap.n_layers);
+        std::vector<llama_token> forced_tokens;
+        std::vector<uint8_t> forced_decode;
+        common_batch teacher_batch(ctx);
+        std::vector<llama_token> evaluated;
+        if (!teacher_raw.empty()) {
+            std::ifstream raw(teacher_raw, std::ios::binary);
+            uint64_t n = 0;
+            raw.read((char *) &n, sizeof(n));
+            if (!raw || n > std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("invalid teacher raw header");
+            }
+            forced_tokens.resize((size_t) n);
+            forced_decode.resize((size_t) n);
+            raw.read((char *) forced_tokens.data(), forced_tokens.size() * sizeof(llama_token));
+            raw.read((char *) forced_decode.data(), forced_decode.size());
+            if (!raw) throw std::runtime_error("truncated teacher raw file");
+        } else {
+        const std::string transcript = slurp(teacher_forced);
+        std::vector<std::string> answers;
+        const std::string begin_marker = "<|im_start|>assistant\n";
+        const std::string end_marker = "<|im_end|>";
+        size_t search = 0;
+        while ((search = transcript.find(begin_marker, search)) != std::string::npos) {
+            const size_t begin = search + begin_marker.size();
+            const size_t end = transcript.find(end_marker, begin);
+            if (end == std::string::npos) {
+                throw std::runtime_error("unterminated assistant message in teacher transcript");
+            }
+            answers.push_back(transcript.substr(begin, end - begin));
+            search = end + end_marker.size();
+        }
+        auto eval = [&](const std::vector<llama_token> & tokens, size_t batch_size, bool decode) {
+            for (size_t off = 0; off < tokens.size(); off += batch_size) {
+                const size_t n = std::min(batch_size, tokens.size() - off);
+                teacher_batch.clear();
+                for (size_t i = 0; i < n; ++i) {
+                    teacher_batch.add(tokens[off + i], evaluated.size() + i, 0, true);
+                }
+                cap.begin(n, decode, 0);
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, teacher_batch.get())) {
+                    throw std::runtime_error("teacher-forced decode failed");
+                }
+                evaluated.insert(evaluated.end(), tokens.begin() + off, tokens.begin() + off + n);
+                forced_tokens.insert(forced_tokens.end(), tokens.begin() + off, tokens.begin() + off + n);
+                forced_decode.insert(forced_decode.end(), n, decode);
+            }
+        };
+        auto tmpls = common_chat_templates_init(model, params.chat_template);
+        std::vector<common_chat_msg> messages;
+        std::string pending;
+        size_t answer_index = 0;
+        const auto turns = read_script(teacher_script);
+        for (size_t ti = 0; ti < turns.size(); ++ti) {
+            const auto & st = turns[ti];
+            if (st.role != "assistant") {
+                common_chat_msg msg;
+                msg.role = st.role == "tool" ? "user" : st.role;
+                msg.content = st.role == "tool" ? "[tool output]\n" + st.content : st.content;
+                const bool add_generation_prompt = ti + 1 < turns.size() && turns[ti + 1].role == "assistant";
+                if (!evaluated.empty()) {
+                    pending += common_chat_format_single(tmpls.get(), messages, msg, add_generation_prompt, params.use_jinja);
+                }
+                messages.push_back(std::move(msg));
+                continue;
+            }
+            if (answer_index >= answers.size()) {
+                throw std::runtime_error("teacher transcript has too few assistant messages");
+            }
+            if (evaluated.empty()) {
+                common_chat_templates_inputs initial;
+                initial.messages = messages; initial.add_generation_prompt = true; initial.use_jinja = params.use_jinja;
+                pending = common_chat_templates_apply(tmpls.get(), initial).prompt;
+            }
+            eval(common_tokenize(ctx, pending, evaluated.empty(), true), 128, false);
+            pending.clear();
+            std::string answer = answers[answer_index];
+            const std::string thinking_prefix = "<think>\n\n</think>\n\n";
+            if (answer.rfind(thinking_prefix, 0) == 0) {
+                answer.erase(0, thinking_prefix.size());
+            }
+            const auto answer_tokens = common_tokenize(ctx, answer, false, true);
+            if ((int) answer_tokens.size() != st.max_tokens) {
+                throw std::runtime_error("assistant message " + std::to_string(answer_index) +
+                    " retokenized to " + std::to_string(answer_tokens.size()) +
+                    " tokens, expected " + std::to_string(st.max_tokens));
+            }
+            eval(answer_tokens, 1, true);
+            // The chat template injects the model's empty thinking preamble
+            // around assistant content, so compare the fully rendered session
+            // after all turns instead of comparing this raw answer string.
+            common_chat_msg answer_msg; answer_msg.role = "assistant"; answer_msg.content = answer;
+            ++answer_index;
+            messages.push_back(std::move(answer_msg));
+        }
+        if (answer_index != answers.size()) {
+            throw std::runtime_error("teacher transcript has extra assistant messages");
+        }
+        common_chat_templates_inputs final_in;
+        final_in.messages = messages; final_in.add_generation_prompt = false; final_in.use_jinja = params.use_jinja;
+        if (common_chat_templates_apply(tmpls.get(), final_in).prompt != transcript) {
+            throw std::runtime_error("rendered replay differs from saved transcript");
+        }
+        const std::string raw_path = output_path + ".teacher.raw";
+        std::ofstream raw(raw_path, std::ios::binary | std::ios::trunc);
+        const uint64_t n = forced_tokens.size();
+        raw.write((const char *) &n, sizeof(n));
+        raw.write((const char *) forced_tokens.data(), forced_tokens.size() * sizeof(llama_token));
+        raw.write((const char *) forced_decode.data(), forced_decode.size());
+        if (!raw) throw std::runtime_error("failed writing " + raw_path);
+        std::fprintf(stderr, "verified %zu tokens to %s\n", forced_tokens.size(), raw_path.c_str());
+        init.reset();
+        llama_backend_free();
+        return 0;
+        }
+        evaluated.clear();
+        size_t off = 0;
+        while (off < forced_tokens.size()) {
+            const bool decode = forced_decode[off] != 0;
+            size_t n = 1;
+            if (!decode) {
+                while (off + n < forced_tokens.size() && !forced_decode[off + n] && n < 128) {
+                    ++n;
+                }
+            }
+            teacher_batch.clear();
+            for (size_t i = 0; i < n; ++i) {
+                teacher_batch.add(forced_tokens[off + i], off + i, 0, true);
+            }
+            cap.begin(n, decode, 0);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, teacher_batch.get())) {
+                throw std::runtime_error("teacher-forced replay failed");
+            }
+            off += n;
+        }
+        std::fprintf(stderr, "teacher-forced %zu verified tokens to %s\n", forced_tokens.size(), output_path.c_str());
+        init.reset();
+        llama_backend_free();
+        return 0;
+    }
+
+    if (prefill_only) {
+        const std::string base = slurp(prefill_base);
+        const auto base_tokens = common_tokenize(ctx, base, true, true);
+        common_batch prefill_batch(ctx);
+        for (size_t job = 0; job < prefill_appends.size(); ++job) {
+            const std::string combined = base + "\n\n" + slurp(prefill_appends[job]);
+            const auto all_tokens = common_tokenize(ctx, combined, true, true);
+            size_t prefix = 0;
+            auto eval_range = [&](size_t first, size_t last) {
+                for (size_t off = first; off < last; off += params.n_ubatch) {
+                    const size_t n = std::min<size_t>(params.n_ubatch, last - off);
+                    prefill_batch.clear();
+                    for (size_t i = 0; i < n; ++i) {
+                        prefill_batch.add(all_tokens[off + i], off + i, 0, off + i + 1 == last);
+                    }
+                    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, prefill_batch.get())) {
+                        throw std::runtime_error("prefill decode failed");
+                    }
+                }
+            };
+            llama_memory_clear(llama_get_memory(ctx), true);
+            if (!prefill_cache.empty()) {
+                std::vector<llama_token> cached(llama_n_ctx(ctx));
+                size_t count = 0;
+                if (!llama_state_load_file(ctx, prefill_cache.c_str(), cached.data(), cached.size(), &count)) {
+                    throw std::runtime_error("failed to load prefill cache " + prefill_cache);
+                }
+                cached.resize(count);
+                while (prefix < cached.size() && prefix < all_tokens.size() && cached[prefix] == all_tokens[prefix]) {
+                    ++prefix;
+                }
+                if (prefix < cached.size() &&
+                        !llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) prefix, -1)) {
+                    llama_memory_clear(llama_get_memory(ctx), true);
+                    eval_range(0, prefix);
+                }
+            } else {
+                while (prefix < base_tokens.size() && prefix < all_tokens.size() &&
+                        base_tokens[prefix] == all_tokens[prefix]) {
+                    ++prefix;
+                }
+                eval_range(0, prefix);
+            }
+            llama_synchronize(ctx);
+            if (!llama_router_log_enable(ctx, prefill_outputs[job].c_str(), params.router_log_max_gb)) {
+                throw std::runtime_error("failed to enable router logging after base prefill");
+            }
+            eval_range(prefix, all_tokens.size());
+            llama_router_log_disable(ctx);
+            std::fprintf(stderr, "logged %zu appended tokens after %zu base tokens to %s\n",
+                         all_tokens.size() - prefix, prefix, prefill_outputs[job].c_str());
+        }
+        init.reset();
+        llama_backend_free();
+        return 0;
+    }
     cap.n_layers = llama_model_n_layer(model);
     cap.k = 10; // validated against the callback tensors
     cap.expert_layers.resize(cap.n_layers); cap.gate_layers.resize(cap.n_layers);
