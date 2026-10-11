@@ -576,6 +576,15 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    void advise_random(size_t first, size_t last) {
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first &= ~(page_size - 1);
+        last = std::min((last + page_size - 1) & ~(page_size - 1), size);
+        if (first < last && madvise((char *) addr + first, last - first, MADV_RANDOM) != 0) {
+            LLAMA_LOG_WARN("warning: madvise(MADV_RANDOM) failed: %s\n", strerror(errno));
+        }
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -640,6 +649,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void advise_random(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -670,6 +684,13 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void advise_random(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -683,6 +704,7 @@ llama_mmap::~llama_mmap() = default;
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
+void llama_mmap::advise_random(size_t first, size_t last) { pimpl->advise_random(first, last); }
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)

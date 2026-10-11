@@ -10,6 +10,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1437,6 +1438,27 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
+        }
+
+        const char * random_pattern = std::getenv("LLAMA_MADV_RANDOM_TENSORS");
+        if (random_pattern && random_pattern[0] != '\0') {
+            try {
+                const std::regex pattern(random_pattern);
+                size_t count = 0;
+                for (const auto & item : weights_map) {
+                    const auto & name = item.first;
+                    const auto & weight = item.second;
+                    if (std::regex_search(name, pattern)) {
+                        mappings.at(weight.idx)->advise_random(
+                                weight.offs, weight.offs + ggml_nbytes(weight.tensor));
+                        LLAMA_LOG_INFO("%s: madvise(MADV_RANDOM) tensor %s\n", __func__, name.c_str());
+                        count++;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: LLAMA_MADV_RANDOM_TENSORS matched %zu tensor(s)\n", __func__, count);
+            } catch (const std::regex_error & error) {
+                throw std::runtime_error(format("invalid LLAMA_MADV_RANDOM_TENSORS regex: %s", error.what()));
+            }
         }
     }
 
