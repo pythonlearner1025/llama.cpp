@@ -19,6 +19,10 @@
 #include <vector>
 #include <unordered_set>
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
@@ -40,6 +44,24 @@
 static uint64_t get_time_ns() {
     using clock = std::chrono::high_resolution_clock;
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
+}
+
+// Delimit only the timed benchmark region for external CUDA profilers. This is
+// opt-in so normal benchmark behavior and timing are unchanged.
+static void cuda_profiler_call(const char * symbol, int repetition) {
+#ifndef _WIN32
+    if (std::getenv("LLAMA_BENCH_CUDA_PROFILE") != nullptr) {
+        const char * profile_rep = std::getenv("LLAMA_BENCH_CUDA_PROFILE_REP");
+        if (profile_rep != nullptr && repetition != std::atoi(profile_rep)) {
+            return;
+        }
+        if (auto fn = reinterpret_cast<int (*)()>(dlsym(RTLD_DEFAULT, symbol))) {
+            fn();
+        }
+    }
+#else
+    (void) symbol;
+#endif
 }
 
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
@@ -352,6 +374,7 @@ struct cmd_params {
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
+    size_t                           moe_cache_mib = 0;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
@@ -398,6 +421,7 @@ static const cmd_params cmd_params_defaults = {
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
+    /* moe_cache_mib        */ 0,
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
@@ -472,6 +496,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  --moe-cache-mib <n>                                (default: %zu)\n", cmd_params_defaults.moe_cache_mib);
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -735,6 +760,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "--moe-cache-mib") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_cache_mib = std::stoull(argv[i]);
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1223,6 +1254,7 @@ struct cmd_params_instance {
     int                poll;
     int                n_gpu_layers;
     int                n_cpu_moe;
+    size_t             moe_cache_mib;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1315,6 +1347,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.moe_cache_size  = moe_cache_mib*1024*1024;
 
         return cparams;
     }
@@ -1371,6 +1404,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_cache_mib         = */ params.moe_cache_mib,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1409,6 +1443,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_cache_mib         = */ params.moe_cache_mib,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1447,6 +1482,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_cache_mib         = */ params.moe_cache_mib,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1490,6 +1526,7 @@ struct test {
     ggml_type                type_v;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
+    size_t                   moe_cache_mib;
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
@@ -1531,6 +1568,7 @@ struct test {
         type_v         = inst.type_v;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
+        moe_cache_mib  = inst.moe_cache_mib;
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
         lazy_mode      = inst.lazy_mode;
@@ -1600,7 +1638,7 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "moe_cache_mib", "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
@@ -1617,7 +1655,7 @@ struct test {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
-            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
+            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" || field == "moe_cache_mib" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
@@ -1690,6 +1728,7 @@ struct test {
                                             ggml_type_name(type_v),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
+                                            std::to_string(moe_cache_mib),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
@@ -2481,6 +2520,7 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
+            cuda_profiler_call("cudaProfilerStart", i);
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
@@ -2511,6 +2551,7 @@ int llama_bench(int argc, char ** argv) {
             }
 
             uint64_t t_ns = get_time_ns() - t_start;
+            cuda_profiler_call("cudaProfilerStop", i);
             t.samples_ns.push_back(t_ns);
         }
 
