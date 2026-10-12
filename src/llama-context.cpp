@@ -363,6 +363,7 @@ llama_context::llama_context(
     cparams.moe_cache_size       = params.moe_cache_size;
     cparams.moe_cache_cpu_misses = params.moe_cache_cpu_misses;
     cparams.moe_prefetch_ahead    = params.moe_prefetch_ahead;
+    cparams.moe_copy_whole_min_used_pct = params.moe_copy_whole_min_used_pct;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -2815,6 +2816,18 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    const int64_t used_total = std::count(st.used.begin(), st.used.end(), true);
+    if (st.batched && lctx->cparams.moe_copy_whole_min_used_pct <= 100 &&
+            used_total*100 >= (int64_t) lctx->cparams.moe_copy_whole_min_used_pct*n_expert) {
+        const size_t bytes = ggml_nbytes(src);
+        ggml_backend_tensor_set_async(backend, dst, src->data, 0, bytes);
+        if (trace) {
+            const std::vector<size_t> chunks = {bytes};
+            moe_copy_trace_write("dense-full", src, ids->ne[1], used_total, bytes, trace_begin, &chunks);
+        }
+        return true;
+    }
+
     // group consecutive experts and copy them together
     size_t copied_bytes = 0;
     int64_t used_experts = 0;
@@ -4047,6 +4060,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_prefetch_ahead          =*/ 0,
+        /*.moe_copy_whole_min_used_pct =*/ 101,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

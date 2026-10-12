@@ -2838,6 +2838,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH_AHEAD"));
     add_opt(common_arg(
+        {"--moe-copy-whole-min-used-pct"}, "P",
+        "copy each CPU expert tensor contiguously when at least P percent of experts are used (default: 101, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 101) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_copy_whole_min_used_pct = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_COPY_WHOLE_MIN_USED_PCT"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
