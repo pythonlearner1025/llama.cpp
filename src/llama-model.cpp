@@ -2100,14 +2100,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             const size_t locks_before = pimpl->mlock_moe_resident.size();
             size_t group_locked = 0;
+            bool group_ok = true;
             for (ggml_tensor * tensor : it->second) {
                 auto lock = std::make_unique<llama_mlock>();
                 lock->init((uint8_t *) tensor->data + (size_t) item.expert*tensor->nb[2]);
                 lock->grow_to(tensor->nb[2]);
+                group_ok = group_ok && lock->succeeded();
                 group_locked += lock->locked_size();
                 pimpl->mlock_moe_resident.emplace_back(std::move(lock));
             }
-            if (group_locked < group_size) {
+            if (!group_ok) {
                 pimpl->mlock_moe_resident.resize(locks_before);
                 LLAMA_LOG_WARN("%s: stopped after an mlock failure; check RLIMIT_MEMLOCK\n", __func__);
                 break;

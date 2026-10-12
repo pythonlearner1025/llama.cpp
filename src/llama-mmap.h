@@ -72,6 +72,7 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
     size_t locked_size() const;
+    bool succeeded() const;
 
     static const bool SUPPORTED;
 
