@@ -2059,11 +2059,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
 #endif
-        constexpr uint64_t reserve = 4ULL*1024*1024*1024;
+        // Leave headroom for page tables, CUDA host allocations, compute
+        // buffers, and processes that grow after this pre-lock snapshot. A
+        // 4 GiB arithmetic reserve fell to 3.66 GiB MemAvailable after model
+        // initialization on the target 32 GiB host; 6 GiB keeps the required
+        // post-load margin above 4 GiB.
+        constexpr uint64_t reserve = 6ULL*1024*1024*1024;
         const uint64_t safe_budget = available > reserve ? available - reserve : 0;
         const size_t budget = (size_t) std::min<uint64_t>(params.moe_host_resident_size, safe_budget);
         if (budget < params.moe_host_resident_size) {
-            LLAMA_LOG_WARN("%s: capping MoE resident budget from %.2f to %.2f GiB to reserve 4 GiB MemAvailable\n",
+            LLAMA_LOG_WARN("%s: capping MoE resident budget from %.2f to %.2f GiB to reserve 6 GiB pre-lock MemAvailable\n",
                     __func__, params.moe_host_resident_size/(1024.0*1024.0*1024.0), budget/(1024.0*1024.0*1024.0));
         }
 
