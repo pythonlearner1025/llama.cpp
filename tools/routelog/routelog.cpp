@@ -412,7 +412,14 @@ int main(int argc, char ** argv) try {
         for (size_t off = 0; off < tok.size(); off += eval_batch) {
             size_t n = std::min<size_t>(eval_batch, tok.size() - off);
             batch.clear();
-            for (size_t q = 0; q < n; ++q) batch.add(tok[off + q], evaluated.size() + q, 0, true);
+            for (size_t q = 0; q < n; ++q) {
+                // Timing-only prefill needs logits only for the token sampled
+                // next. Requesting every token's logits made a large physical
+                // ubatch exceed the context's output reservation; 128-token
+                // router-capture chunks previously masked that harness bug.
+                batch.add(tok[off + q], evaluated.size() + q, 0,
+                          decode || q + 1 == n);
+            }
             cap.begin(n, decode, turn);
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) throw std::runtime_error("decode failed");
             evaluated.insert(evaluated.end(), tok.begin() + off, tok.begin() + off + n);
