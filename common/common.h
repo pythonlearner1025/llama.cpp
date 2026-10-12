@@ -600,6 +600,7 @@ struct common_params {
     bool moe_cache_cpu_misses = false; // compute cache misses on the CPU instead of uploading them synchronously
     std::string moe_cache_static_file; // ranked layer/expert pairs to preload, empty keeps dynamic admission
     int32_t moe_prefetch_ahead = 0; // MADV_WILLNEED CPU expert tensors N layers ahead during prefill
+    int32_t moe_copy_whole_min_used_pct = 101; // one contiguous expert upload at/above this density; 101 disables
     size_t moe_host_resident_size = 0; // fixed, mlocked host expert budget in bytes
     std::string moe_host_resident_plan; // ranked "layer expert [score]" plan
 
