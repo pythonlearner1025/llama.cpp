@@ -793,7 +793,7 @@ struct llama_mlock::impl {
     static void raw_unlock(const void * addr, size_t len) {}
 #endif
 
-    impl() : addr(NULL), size(0), failed_already(false) {}
+    impl() : addr(NULL), size(0), offset(0), failed_already(false) {}
 
     ~impl() {
         if (addr != NULL && size > 0) {
@@ -803,7 +803,11 @@ struct llama_mlock::impl {
 
     void init(void * ptr) {
         GGML_ASSERT(addr == NULL && size == 0);
-        addr = ptr;
+        const size_t granularity = lock_granularity();
+        const uintptr_t raw = (uintptr_t) ptr;
+        const uintptr_t aligned = raw & ~(uintptr_t) (granularity - 1);
+        addr = (void *) aligned;
+        offset = raw - aligned;
     }
 
     void grow_to(size_t target_size) {
@@ -812,7 +816,7 @@ struct llama_mlock::impl {
             return;
         }
         size_t granularity = lock_granularity();
-        target_size = (target_size + granularity - 1) & ~(granularity - 1);
+        target_size = (target_size + offset + granularity - 1) & ~(granularity - 1);
         if (target_size > size) {
             if (raw_lock((uint8_t *) addr + size, target_size - size)) {
                 size = target_size;
@@ -824,6 +828,7 @@ struct llama_mlock::impl {
 
     void * addr;
     size_t size;
+    size_t offset;
 
     bool failed_already;
 };
