@@ -623,6 +623,12 @@ struct llama_moe_cache::impl {
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+        // Fixed caches are a decode-only placement.  Reconstructing a large-batch
+        // expert tensor from globally ranked shared-bank slots is not yet exact;
+        // leave prefill on the canonical host weights.
+        if (static_cache) {
+            return 0;
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
