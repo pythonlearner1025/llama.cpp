@@ -2794,6 +2794,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_MISSES"));
     add_opt(common_arg(
+        {"--moe-cache-pinned-ring-mib"}, "N",
+        "pinned host staging ring size in MiB for asynchronous MoE cache admission (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_pinned_ring_size = (size_t) value*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PINNED_RING_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-insert-cap"}, "N",
+        "maximum asynchronous MoE cache admissions per decode token (default: 48)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_insert_cap = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_INSERT_CAP"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

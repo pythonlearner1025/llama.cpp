@@ -6,7 +6,9 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <stdexcept>
@@ -167,6 +169,30 @@ static int32_t llama_moe_cache_i32(const ggml_tensor * t, int64_t i) {
 }
 
 struct llama_moe_cache::impl {
+    struct upload_copy {
+        ggml_tensor * bank;
+        const uint8_t * src;
+        size_t offset;
+        size_t size;
+    };
+
+    struct upload_job {
+        int32_t id;
+        int32_t ig;
+        int32_t il;
+        int32_t expert;
+        int32_t slot;
+        size_t bytes;
+        std::vector<upload_copy> copies;
+    };
+
+    struct ring_segment {
+        size_t offset = 0;
+        bool busy = false;
+        ggml_backend_event_ptr event;
+        std::vector<upload_job> jobs;
+    };
+
     // a GPU with its own budget and banks, it caches the layers assigned to it
     struct device {
         ggml_backend_t backend;
@@ -179,6 +205,14 @@ struct llama_moe_cache::impl {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
+
+        ggml_backend_buffer_ptr staging;
+        uint8_t * staging_data = nullptr;
+        size_t staging_segment_size = 0;
+        size_t staging_capacity = 0;
+        size_t staging_pending = 0;
+        size_t staging_next = 0;
+        std::vector<ring_segment> staging_segments;
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -216,25 +250,19 @@ struct llama_moe_cache::impl {
         int32_t il = -1;
     };
 
-    struct upload_copy {
-        ggml_tensor * bank;
-        const uint8_t * src;
-        size_t offset;
-        size_t size;
-    };
-
-    struct upload_job {
-        int32_t id;
-        int32_t il;
-        int32_t expert;
-        int32_t slot;
-        std::vector<upload_copy> copies;
-    };
-
     static constexpr int64_t max_batch = 32;
+    static constexpr size_t n_ring_segments = 4;
 
     int32_t n_expert_used;
     bool cpu_misses;
+    size_t pinned_ring_size;
+    int32_t insert_cap;
+    int32_t admit_last_layer = -1;
+    int32_t admit_count = 0;
+    size_t stats_admitted = 0;
+    size_t stats_skipped = 0;
+    size_t stats_batches = 0;
+    size_t stats_transfers = 0;
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -265,8 +293,16 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool cpu_misses) :
-            n_expert_used(model.hparams.n_expert_used_max()), cpu_misses(cpu_misses), layers(model.layers.size()), cpu_miss_callbacks(model.layers.size()) {
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
+            size_t size, bool cpu_misses, size_t pinned_ring_size, int32_t insert_cap) :
+            n_expert_used(model.hparams.n_expert_used_max()), cpu_misses(cpu_misses), pinned_ring_size(pinned_ring_size), insert_cap(insert_cap),
+            layers(model.layers.size()), cpu_miss_callbacks(model.layers.size()) {
+        if (pinned_ring_size > 0 && !cpu_misses) {
+            throw std::runtime_error("pinned MoE cache admission requires CPU miss execution");
+        }
+        if (insert_cap < 0) {
+            throw std::runtime_error("MoE cache insert cap must not be negative");
+        }
         for (size_t il = 0; il < cpu_miss_callbacks.size(); ++il) {
             cpu_miss_callbacks[il] = { this, (int32_t) il };
         }
@@ -497,6 +533,62 @@ struct llama_moe_cache::impl {
         }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+        if (pinned_ring_size > 0 && !model.hparams.no_alloc) {
+            for (size_t id = 0; id < devices.size(); ++id) {
+                device & d = devices[id];
+                if (d.host_bytes == 0) {
+                    continue;
+                }
+                size_t expert_bytes_max = 0;
+                for (const group & g : groups) {
+                    if (g.id != (int32_t) id || g.n_slots == 0) {
+                        continue;
+                    }
+                    size_t expert_bytes = 0;
+                    for (const ggml_tensor * t : g.ref) {
+                        expert_bytes += t->nb[2];
+                    }
+                    expert_bytes_max = std::max(expert_bytes_max, expert_bytes);
+                }
+                if (expert_bytes_max == 0) {
+                    continue;
+                }
+
+                ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (!props.caps.async || !props.caps.host_buffer || !props.caps.events || host_buft == nullptr) {
+                    throw std::runtime_error("MoE cache pinned admission requires async host buffers and events");
+                }
+
+                const size_t budget = (size_t) ((double) pinned_ring_size*d.split/split_sum);
+                d.staging_segment_size = budget/n_ring_segments;
+                const size_t entries_per_segment = d.staging_segment_size/expert_bytes_max;
+                if (entries_per_segment == 0) {
+                    throw std::runtime_error("MoE cache pinned admission ring is too small");
+                }
+                d.staging_capacity = entries_per_segment*n_ring_segments;
+                const size_t staging_size = d.staging_segment_size*n_ring_segments;
+                d.staging.reset(ggml_backend_buft_alloc_buffer(host_buft, staging_size));
+                if (!d.staging || ggml_backend_buffer_get_type(d.staging.get()) != host_buft) {
+                    throw std::runtime_error("failed to allocate pinned MoE cache admission ring");
+                }
+                d.staging_data = (uint8_t *) ggml_backend_buffer_get_base(d.staging.get());
+                for (size_t is = 0; is < n_ring_segments; ++is) {
+                    ring_segment segment;
+                    segment.offset = is*d.staging_segment_size;
+                    segment.event.reset(ggml_backend_event_new(dev));
+                    if (!segment.event) {
+                        throw std::runtime_error("failed to create MoE cache admission event");
+                    }
+                    d.staging_segments.push_back(std::move(segment));
+                }
+                LLAMA_LOG_INFO("%s: %10s MoE admission ring = %.2f MiB, %zu expert reservations\n", __func__,
+                    ggml_backend_buft_name(host_buft), staging_size/1024.0/1024.0, d.staging_capacity);
+            }
+        }
+
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
             if (d.host_bytes == 0) {
@@ -662,6 +754,7 @@ struct llama_moe_cache::impl {
     void hybrid_admit(int32_t il, const ggml_tensor * selected) {
         layer & l = layers[il];
         group & g = groups[l.ig];
+        device & d = devices[g.id];
 
         const size_t n = ggml_nelements(selected);
         ids.resize(n);
@@ -687,11 +780,27 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (pinned_ring_size > 0) {
+            if (il <= admit_last_layer) {
+                admit_count = 0;
+            }
+            admit_last_layer = il;
+        }
+
+        bool can_admit = pinned_ring_size == 0 || admit_count < insert_cap;
+        if (can_admit && pinned_ring_size > 0) {
+            std::lock_guard<std::mutex> lock(upload_mutex);
+            can_admit = d.staging_pending < d.staging_capacity;
+        }
+
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, 1)) {
+        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, can_admit ? 1 : 0)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         GGML_UNUSED(n_hit);
+        if (!can_admit && g.lru.uniq.size() > visible_hits) {
+            stats_skipped++;
+        }
 
         size_t bytes = 0;
         for (const auto & fill : fills) {
@@ -700,17 +809,27 @@ struct llama_moe_cache::impl {
                 const int32_t old_e  = fill.evicted_key%g.lru.n_expert;
                 ((int32_t *) layers[old_il].slot_map->data)[old_e] = g.n_slots;
             }
-            upload_job job = { g.id, il, fill.expert, fill.slot, {} };
+            upload_job job = { g.id, l.ig, il, fill.expert, fill.slot, 0, {} };
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                 const ggml_tensor * w = l.experts[ip];
                 job.copies.push_back({ g.banks[ip], (const uint8_t *) w->data + fill.expert*w->nb[2],
                                        (size_t) fill.slot*w->nb[2], w->nb[2] });
+                job.bytes += w->nb[2];
                 bytes += w->nb[2];
             }
             {
                 std::lock_guard<std::mutex> lock(upload_mutex);
+                if (pinned_ring_size > 0) {
+                    d.staging_pending++;
+                }
                 upload_queue.push_back(std::move(job));
             }
+            if (pinned_ring_size > 0) {
+                admit_count++;
+                stats_admitted++;
+            }
+        }
+        if (!fills.empty()) {
             upload_cv.notify_one();
         }
 
@@ -720,7 +839,124 @@ struct llama_moe_cache::impl {
         st.bytes += bytes;
     }
 
+    void complete_segment(device & d, ring_segment & segment) {
+        if (!segment.busy) {
+            return;
+        }
+        ggml_backend_event_synchronize(segment.event.get());
+        {
+            std::lock_guard<std::mutex> lock(upload_mutex);
+            for (upload_job & job : segment.jobs) {
+                upload_done.push_back(std::move(job));
+                d.staging_pending--;
+            }
+        }
+        segment.jobs.clear();
+        segment.busy = false;
+    }
+
+    void upload_loop_pinned() {
+        for (;;) {
+            std::vector<upload_job> batch;
+            int32_t id = -1;
+            int32_t ig = -1;
+            bool stop = false;
+            {
+                std::unique_lock<std::mutex> lock(upload_mutex);
+                upload_cv.wait(lock, [&] { return upload_stop || !upload_queue.empty(); });
+                if (!upload_stop && upload_queue.size() < 4) {
+                    upload_cv.wait_for(lock, std::chrono::milliseconds(1), [&] { return upload_stop || upload_queue.size() >= 4; });
+                }
+                stop = upload_stop;
+                if (!upload_queue.empty()) {
+                    id = upload_queue.front().id;
+                    ig = upload_queue.front().ig;
+                }
+            }
+
+            if (id < 0) {
+                for (device & d : devices) {
+                    for (ring_segment & segment : d.staging_segments) {
+                        complete_segment(d, segment);
+                    }
+                }
+                if (stop) {
+                    return;
+                }
+                continue;
+            }
+
+            device & d = devices[id];
+            ring_segment & segment = d.staging_segments[d.staging_next];
+            complete_segment(d, segment);
+            d.staging_next = (d.staging_next + 1)%d.staging_segments.size();
+
+            size_t bytes = 0;
+            {
+                std::lock_guard<std::mutex> lock(upload_mutex);
+                while (!upload_queue.empty() && upload_queue.front().id == id && upload_queue.front().ig == ig &&
+                        bytes + upload_queue.front().bytes <= d.staging_segment_size) {
+                    bytes += upload_queue.front().bytes;
+                    batch.push_back(std::move(upload_queue.front()));
+                    upload_queue.pop_front();
+                }
+            }
+            GGML_ASSERT(!batch.empty());
+
+            uint8_t * staging = d.staging_data + segment.offset;
+            size_t cursor = 0;
+            for (size_t ip = 0; ip < batch[0].copies.size(); ++ip) {
+                ggml_tensor * run_bank = nullptr;
+                uint8_t * run_src = nullptr;
+                size_t run_offset = 0;
+                size_t run_size = 0;
+                for (upload_job & job : batch) {
+                    const upload_copy & copy = job.copies[ip];
+                    GGML_ASSERT(cursor + copy.size <= d.staging_segment_size);
+                    memcpy(staging + cursor, copy.src, copy.size);
+                    if (run_bank != copy.bank || run_offset + run_size != copy.offset) {
+                        if (run_bank != nullptr) {
+                            ggml_backend_tensor_set_async(d.upload_backend.get(), run_bank, run_src, run_offset, run_size);
+                            stats_transfers++;
+                        }
+                        run_bank = copy.bank;
+                        run_src = staging + cursor;
+                        run_offset = copy.offset;
+                        run_size = 0;
+                    }
+                    run_size += copy.size;
+                    cursor += copy.size;
+                }
+                if (run_bank != nullptr) {
+                    ggml_backend_tensor_set_async(d.upload_backend.get(), run_bank, run_src, run_offset, run_size);
+                    stats_transfers++;
+                }
+            }
+            ggml_backend_event_record(segment.event.get(), d.upload_backend.get());
+            segment.jobs = std::move(batch);
+            segment.busy = true;
+            stats_batches++;
+
+            bool queue_empty;
+            {
+                std::lock_guard<std::mutex> lock(upload_mutex);
+                queue_empty = upload_queue.empty();
+            }
+            if (queue_empty) {
+                for (device & flush_device : devices) {
+                    for (ring_segment & flush_segment : flush_device.staging_segments) {
+                        complete_segment(flush_device, flush_segment);
+                    }
+                }
+            }
+        }
+    }
+
     void upload_loop() {
+        if (pinned_ring_size > 0) {
+            upload_loop_pinned();
+            return;
+        }
         for (;;) {
             upload_job job;
             {
@@ -758,11 +994,16 @@ struct llama_moe_cache::impl {
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
+        if (pinned_ring_size > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: pinned admission: %zu admitted, %zu batches, %zu transfers, %zu skipped\n",
+                stats_admitted, stats_batches, stats_transfers, stats_skipped);
+        }
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool cpu_misses) :
-    pimpl(new impl(model, backends, bufts, size, cpu_misses)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
+        size_t size, bool cpu_misses, size_t pinned_ring_size, int32_t insert_cap) :
+    pimpl(new impl(model, backends, bufts, size, cpu_misses, pinned_ring_size, insert_cap)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -820,6 +1061,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
     for (const auto & d : pimpl->devices) {
         if (d.buf) {
             res[ggml_backend_buffer_get_type(d.buf.get())] += d.buf_size;
+        }
+        if (d.staging) {
+            res[ggml_backend_buffer_get_type(d.staging.get())] += ggml_backend_buffer_get_size(d.staging.get());
         }
     }
     if (pimpl->buf_host) {

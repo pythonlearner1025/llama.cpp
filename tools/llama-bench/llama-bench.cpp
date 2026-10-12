@@ -381,6 +381,8 @@ struct cmd_params {
 // Cache settings are process-wide benchmark controls, not sweep dimensions.
 static size_t bench_moe_cache_mib = 0;
 static bool   bench_moe_cache_cpu_misses = false;
+static size_t bench_moe_cache_pinned_ring_mib = 0;
+static int32_t bench_moe_cache_insert_cap = 48;
 
 static const cmd_params cmd_params_defaults = {
     /* model                */ { "models/7B/ggml-model-q4_0.gguf" },
@@ -478,6 +480,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  --moe-cache-mib <n>                                (default: 0)\n");
     printf("  --moe-cache-cpu-misses                             (default: disabled)\n");
+    printf("  --moe-cache-pinned-ring-mib <n>                    (default: 0)\n");
+    printf("  --moe-cache-insert-cap <n>                         (default: 48)\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -749,6 +753,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 bench_moe_cache_mib = std::stoull(argv[i]);
             } else if (arg == "--moe-cache-cpu-misses") {
                 bench_moe_cache_cpu_misses = true;
+            } else if (arg == "--moe-cache-pinned-ring-mib") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                bench_moe_cache_pinned_ring_mib = std::stoull(argv[i]);
+            } else if (arg == "--moe-cache-insert-cap") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                bench_moe_cache_insert_cap = std::stoi(argv[i]);
+                if (bench_moe_cache_insert_cap < 0) {
+                    invalid_param = true;
+                    break;
+                }
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1331,6 +1351,8 @@ struct cmd_params_instance {
         cparams.swa_full        = false;
         cparams.moe_cache_size  = bench_moe_cache_mib*1024*1024;
         cparams.moe_cache_cpu_misses = bench_moe_cache_cpu_misses;
+        cparams.moe_cache_pinned_ring_size = bench_moe_cache_pinned_ring_mib*1024*1024;
+        cparams.moe_cache_insert_cap = bench_moe_cache_insert_cap;
 
         return cparams;
     }

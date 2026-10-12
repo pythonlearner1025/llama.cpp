@@ -594,6 +594,8 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    size_t moe_cache_pinned_ring_size = 0; // pinned host staging size in bytes for asynchronous MoE cache admission
+    int32_t moe_cache_insert_cap = 48; // maximum asynchronous MoE cache admissions per decode token
     bool moe_cache_cpu_misses = false; // compute cache misses on the CPU instead of uploading them synchronously
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
