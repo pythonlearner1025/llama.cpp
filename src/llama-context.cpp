@@ -61,7 +61,8 @@ static moe_copy_trace_snapshot moe_copy_trace_now() {
 }
 
 static void moe_copy_trace_write(const char * mode, const ggml_tensor * src, int64_t tokens,
-        int64_t used, size_t bytes, const moe_copy_trace_snapshot & begin) {
+        int64_t used, size_t bytes, const moe_copy_trace_snapshot & begin,
+        const std::vector<size_t> * chunks = nullptr) {
     const char * path = std::getenv("LLAMA_MOE_COPY_TRACE");
     if (!path || !path[0]) {
         return;
@@ -72,10 +73,16 @@ static void moe_copy_trace_write(const char * mode, const ggml_tensor * src, int
                 "{\"mode\":\"%s\",\"tensor\":\"%s\",\"tokens\":%" PRId64
                 ",\"used_experts\":%" PRId64 ",\"bytes\":%zu,\"start_us\":%" PRId64
                 ",\"duration_us\":%" PRId64 ",\"storage_read_bytes\":%" PRIu64
-                ",\"minor_faults\":%" PRId64 ",\"major_faults\":%" PRId64 "}\n",
+                ",\"minor_faults\":%" PRId64 ",\"major_faults\":%" PRId64 ",\"copy_chunks\":[",
                 mode, src->name, tokens, used, bytes, begin.time_us, end.time_us - begin.time_us,
                 end.read_bytes - begin.read_bytes, end.minor_faults - begin.minor_faults,
                 end.major_faults - begin.major_faults);
+        if (chunks) {
+            for (size_t i = 0; i < chunks->size(); ++i) {
+                std::fprintf(f, "%s%zu", i ? "," : "", (*chunks)[i]);
+            }
+        }
+        std::fprintf(f, "]}\n");
         std::fclose(f);
     }
 }
@@ -2812,6 +2819,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // group consecutive experts and copy them together
     size_t copied_bytes = 0;
     int64_t used_experts = 0;
+    std::vector<size_t> copy_chunks;
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
             first++;
@@ -2845,13 +2853,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
             copied_bytes += size;
+            copy_chunks.push_back(size);
         }
 
         first = last + 1;
     }
 
     if (trace) {
-        moe_copy_trace_write("selected", src, ids->ne[1], used_experts, copied_bytes, trace_begin);
+        moe_copy_trace_write("selected", src, ids->ne[1], used_experts, copied_bytes, trace_begin, &copy_chunks);
     }
 
     return true;
