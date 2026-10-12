@@ -8,8 +8,11 @@
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -235,6 +238,7 @@ struct llama_moe_cache::impl {
 
     int32_t n_expert_used;
     bool cpu_misses;
+    bool static_cache;
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -265,8 +269,11 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool cpu_misses) :
-            n_expert_used(model.hparams.n_expert_used_max()), cpu_misses(cpu_misses), layers(model.layers.size()), cpu_miss_callbacks(model.layers.size()) {
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool cpu_misses, const std::string & static_file) :
+            n_expert_used(model.hparams.n_expert_used_max()), cpu_misses(cpu_misses), static_cache(!static_file.empty()), layers(model.layers.size()), cpu_miss_callbacks(model.layers.size()) {
+        if (static_cache && !cpu_misses) {
+            throw std::invalid_argument("a static MoE cache requires CPU miss computation");
+        }
         for (size_t il = 0; il < cpu_miss_callbacks.size(); ++il) {
             cpu_miss_callbacks[il] = { this, (int32_t) il };
         }
@@ -487,6 +494,10 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+
+            if (static_cache) {
+                preload_static(static_file);
+            }
         }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
@@ -511,9 +522,70 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        if (cpu_misses && !model.hparams.no_alloc) {
+        if (cpu_misses && !static_cache && !model.hparams.no_alloc) {
             upload_thread = std::thread([this] { upload_loop(); });
         }
+    }
+
+    void preload_static(const std::string & path) {
+        std::ifstream input(path);
+        if (!input) {
+            throw std::runtime_error("failed to open static MoE cache file: " + path);
+        }
+
+        std::vector<int32_t> used(groups.size(), 0);
+        size_t selected = 0;
+        std::string line;
+        while (std::getline(input, line)) {
+            const size_t comment = line.find('#');
+            if (comment != std::string::npos) {
+                line.resize(comment);
+            }
+            std::replace(line.begin(), line.end(), ',', ' ');
+            std::istringstream fields(line);
+            int32_t il = -1;
+            int32_t expert = -1;
+            if (!(fields >> il >> expert)) {
+                continue;
+            }
+            if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+                continue;
+            }
+            layer & l = layers[il];
+            group & g = groups[l.ig];
+            if (expert < 0 || expert >= g.lru.n_expert) {
+                throw std::runtime_error("invalid layer/expert in static MoE cache file: " + std::to_string(il) + " " + std::to_string(expert));
+            }
+            if (l.cache_map[expert] >= 0 || used[l.ig] >= g.n_slots) {
+                continue;
+            }
+
+            const int32_t slot = used[l.ig]++;
+            const int32_t key = il*g.lru.n_expert + expert;
+            g.lru.key_of[slot] = key;
+            l.cache_map[expert] = slot;
+            ((int32_t *) l.slot_map->data)[expert] = slot;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                ggml_backend_tensor_set_async(devices[g.id].backend, g.banks[ip],
+                    (const uint8_t *) w->data + expert*w->nb[2], slot*w->nb[2], w->nb[2]);
+            }
+            selected++;
+        }
+        if (selected == 0) {
+            throw std::runtime_error("static MoE cache file selected no cacheable experts: " + path);
+        }
+        for (device & d : devices) {
+            if (d.buf) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        size_t capacity = 0;
+        for (const group & g : groups) {
+            capacity += g.n_slots;
+        }
+        LLAMA_LOG_INFO("%s: preloaded %zu/%zu fixed expert slots from %s; dynamic admission disabled\n",
+            __func__, selected, capacity, path.c_str());
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -666,12 +738,21 @@ struct llama_moe_cache::impl {
         const size_t n = ggml_nelements(selected);
         ids.resize(n);
         size_t visible_hits = 0;
+        size_t unique = 0;
         for (size_t i = 0; i < n; ++i) {
             ids[i] = llama_moe_cache_i32(selected, i);
             GGML_ASSERT(ids[i] >= 0 && ids[i] < g.lru.n_expert);
             if (std::find(ids.begin(), ids.begin() + i, ids[i]) == ids.begin() + i) {
+                unique++;
                 visible_hits += ((int32_t *) l.slot_map->data)[ids[i]] != g.n_slots;
             }
+        }
+
+        if (static_cache) {
+            stats & st = n <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+            st.hits += visible_hits;
+            st.misses += unique - visible_hits;
+            return;
         }
 
         std::deque<upload_job> done;
@@ -761,8 +842,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool cpu_misses) :
-    pimpl(new impl(model, backends, bufts, size, cpu_misses)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool cpu_misses, const std::string & static_file) :
+    pimpl(new impl(model, backends, bufts, size, cpu_misses, static_file)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

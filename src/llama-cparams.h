@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
@@ -58,6 +59,7 @@ struct llama_cparams {
     bool router_log;
 
     size_t moe_cache_size;
+    std::string moe_cache_static_file;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

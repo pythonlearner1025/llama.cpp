@@ -598,6 +598,7 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     bool moe_cache_cpu_misses = false; // compute cache misses on the CPU instead of uploading them synchronously
+    std::string moe_cache_static_file; // ranked layer/expert pairs to preload, empty keeps dynamic admission
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
