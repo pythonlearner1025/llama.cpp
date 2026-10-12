@@ -408,6 +408,7 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         const char * moe_cache_static_file; // ranked "layer expert" pairs to preload; nullptr keeps dynamic admission [EXPERIMENTAL]
+        int32_t moe_prefetch_ahead; // prefetch CPU MoE tensors this many layers ahead, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

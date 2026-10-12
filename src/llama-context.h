@@ -374,11 +374,13 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        std::vector<bool>    prefetched;
 
         void reset() {
             ids = nullptr;
             ids_data.clear();
             used.clear();
+            prefetched.clear();
         }
     };
 
