@@ -496,6 +496,9 @@ struct common_params {
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
+    std::string router_log_dir = ""; // empty disables full MoE router-log capture
+    double router_log_max_gb = 20.0;
+
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;

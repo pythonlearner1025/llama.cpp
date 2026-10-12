@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1440,6 +1441,13 @@ private:
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
+                }
+                if (slot.task && slot.stats.t_start > 0) {
+                    const int64_t end_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                    const int64_t start_ms = end_ms - slot.stats.t_elapsed_us() / 1000;
+                    llama_router_log_request(ctx_tgt, slot.id, slot.task->id,
+                            slot.task->params.oaicompat_cmpl_id.c_str(), slot.task->n_tokens(), start_ms, end_ms);
                 }
             };
 

@@ -441,6 +441,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
+    model->path_model = path_model;
+
     return model;
 }
 
@@ -618,4 +620,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

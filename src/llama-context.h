@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_router_log;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -59,6 +60,11 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    void router_log_request(int32_t seq_id, int64_t task_id, const char * request_id,
+                            int32_t prompt_tokens, int64_t start_unix_ms, int64_t end_unix_ms);
+    bool router_log_enable(const char * dir, double max_gb);
+    void router_log_disable();
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -302,6 +308,7 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    std::shared_ptr<llama_router_log> router_log;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

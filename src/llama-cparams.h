@@ -55,6 +55,7 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
     bool moe_cache_cpu_misses;
+    bool router_log;
 
     size_t moe_cache_size;
 
