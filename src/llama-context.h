@@ -375,12 +375,14 @@ private:
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
         std::vector<bool>    prefetched;
+        bool batched = false;
 
         void reset() {
             ids = nullptr;
             ids_data.clear();
             used.clear();
             prefetched.clear();
+            batched = false;
         }
     };
 
