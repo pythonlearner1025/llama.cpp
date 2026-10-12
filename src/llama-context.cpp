@@ -2719,6 +2719,7 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    copy_experts.batched = batched;
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2742,6 +2743,36 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     auto & st = lctx->copy_experts;
 
+    // madvise(MADV_WILLNEED) returns before I/O completes. Issuing it several
+    // layers ahead allows NVMe reads for layer l+N to overlap copies and GPU
+    // work for the intervening layers. Decode is intentionally excluded. This
+    // is before the selective-copy checks so it also pipelines full-copy graph
+    // splits, which are common in batched prefill.
+    if (lctx->cparams.moe_prefetch_ahead > 0 && st.batched) {
+        int layer = -1;
+        if (std::sscanf(src->name, "blk.%d.", &layer) == 1) {
+            const int target = layer + lctx->cparams.moe_prefetch_ahead;
+            const int n_layer = (int) lctx->model.hparams.n_layer();
+            if (target >= 0 && target < n_layer) {
+                if ((int) st.prefetched.size() != n_layer) {
+                    st.prefetched.assign(n_layer, false);
+                }
+                if (!st.prefetched[target]) {
+                    st.prefetched[target] = true;
+                    llama_memory_ranges ranges;
+                    for (const char * kind : {"gate", "gate_up", "up", "down"}) {
+                        const std::string name = "blk." + std::to_string(target) + ".ffn_" + kind + "_exps.weight";
+                        const ggml_tensor * tensor = lctx->model.get_tensor(name.c_str());
+                        if (tensor && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
+                            ranges.push_back({tensor->data, ggml_nbytes(tensor)});
+                        }
+                    }
+                    llama_prefetch(std::move(ranges));
+                }
+            }
+        }
+    }
+
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
         if (trace) moe_copy_trace_write("fallback-empty", src, 0, 0, ggml_nbytes(src), trace_begin);
@@ -2760,34 +2791,6 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
-
-    // madvise(MADV_WILLNEED) returns before I/O completes. Issuing it several
-    // layers ahead allows NVMe reads for layer l+N to overlap copies and GPU
-    // work for the intervening layers. Decode is intentionally excluded.
-    if (lctx->cparams.moe_prefetch_ahead > 0 && ids->ne[1] >= 32) {
-        int layer = -1;
-        if (std::sscanf(src->name, "blk.%d.", &layer) == 1) {
-            const int target = layer + lctx->cparams.moe_prefetch_ahead;
-            const int n_layer = (int) lctx->model.hparams.n_layer();
-            if (target >= 0 && target < n_layer) {
-                if ((int) st.prefetched.size() != n_layer) {
-                    st.prefetched.assign(lctx->model.hparams.n_layer(), false);
-                }
-                if (!st.prefetched[target]) {
-                    st.prefetched[target] = true;
-                    llama_memory_ranges ranges;
-                    for (const char * kind : {"gate", "gate_up", "up", "down"}) {
-                        const std::string name = "blk." + std::to_string(target) + ".ffn_" + kind + "_exps.weight";
-                        const ggml_tensor * tensor = lctx->model.get_tensor(name.c_str());
-                        if (tensor && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
-                            ranges.push_back({tensor->data, ggml_nbytes(tensor)});
-                        }
-                    }
-                    llama_prefetch(std::move(ranges));
-                }
-            }
-        }
-    }
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
