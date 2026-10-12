@@ -16,6 +16,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,61 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
+
+struct moe_copy_trace_snapshot {
+    int64_t time_us = 0;
+    uint64_t read_bytes = 0;
+    int64_t minor_faults = 0;
+    int64_t major_faults = 0;
+};
+
+static moe_copy_trace_snapshot moe_copy_trace_now() {
+    moe_copy_trace_snapshot out;
+    out.time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+#ifdef __linux__
+    if (FILE * f = std::fopen("/proc/self/io", "r")) {
+        char key[64];
+        uint64_t value;
+        while (std::fscanf(f, "%63s %" SCNu64, key, &value) == 2) {
+            if (std::strcmp(key, "read_bytes:") == 0) {
+                out.read_bytes = value;
+            }
+        }
+        std::fclose(f);
+    }
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        out.minor_faults = usage.ru_minflt;
+        out.major_faults = usage.ru_majflt;
+    }
+#endif
+    return out;
+}
+
+static void moe_copy_trace_write(const char * mode, const ggml_tensor * src, int64_t tokens,
+        int64_t used, size_t bytes, const moe_copy_trace_snapshot & begin) {
+    const char * path = std::getenv("LLAMA_MOE_COPY_TRACE");
+    if (!path || !path[0]) {
+        return;
+    }
+    const auto end = moe_copy_trace_now();
+    if (FILE * f = std::fopen(path, "a")) {
+        std::fprintf(f,
+                "{\"mode\":\"%s\",\"tensor\":\"%s\",\"tokens\":%" PRId64
+                ",\"used_experts\":%" PRId64 ",\"bytes\":%zu,\"start_us\":%" PRId64
+                ",\"duration_us\":%" PRId64 ",\"storage_read_bytes\":%" PRIu64
+                ",\"minor_faults\":%" PRId64 ",\"major_faults\":%" PRId64 "}\n",
+                mode, src->name, tokens, used, bytes, begin.time_us, end.time_us - begin.time_us,
+                end.read_bytes - begin.read_bytes, end.minor_faults - begin.minor_faults,
+                end.major_faults - begin.major_faults);
+        std::fclose(f);
+    }
+}
 
 //
 // llama_context
@@ -2675,6 +2731,8 @@ ggml_status llama_context::graph_compute(
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+    const bool trace = std::getenv("LLAMA_MOE_COPY_TRACE") != nullptr && std::strstr(src->name, "_exps") != nullptr;
+    const auto trace_begin = trace ? moe_copy_trace_now() : moe_copy_trace_snapshot {};
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
@@ -2685,10 +2743,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
+        if (trace) moe_copy_trace_write("fallback-empty", src, 0, 0, ggml_nbytes(src), trace_begin);
         return false;
     }
     const ggml_tensor * node = ggml_graph_node(graph, 0);
     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        if (trace) moe_copy_trace_write("fallback-graph", src, 0, 0, ggml_nbytes(src), trace_begin);
         return false;
     }
 
@@ -2718,6 +2778,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // group consecutive experts and copy them together
+    size_t copied_bytes = 0;
+    int64_t used_experts = 0;
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
             first++;
@@ -2727,6 +2789,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         while (last + 1 < n_expert && st.used[last + 1]) {
             last++;
         }
+        used_experts += last - first + 1;
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;
@@ -2749,9 +2812,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            copied_bytes += size;
         }
 
         first = last + 1;
+    }
+
+    if (trace) {
+        moe_copy_trace_write("selected", src, ids->ne[1], used_experts, copied_bytes, trace_begin);
     }
 
     return true;
