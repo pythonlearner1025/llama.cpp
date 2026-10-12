@@ -58,6 +58,7 @@ struct llama_cparams {
     bool router_log;
 
     size_t moe_cache_size;
+    int32_t moe_prefetch_ahead;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -355,6 +355,7 @@ llama_context::llama_context(
     cparams.kv_unified           = params.kv_unified;
     cparams.moe_cache_size       = params.moe_cache_size;
     cparams.moe_cache_cpu_misses = params.moe_cache_cpu_misses;
+    cparams.moe_prefetch_ahead    = params.moe_prefetch_ahead;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -2759,6 +2760,34 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
+    // madvise(MADV_WILLNEED) returns before I/O completes. Issuing it several
+    // layers ahead allows NVMe reads for layer l+N to overlap copies and GPU
+    // work for the intervening layers. Decode is intentionally excluded.
+    if (lctx->cparams.moe_prefetch_ahead > 0 && ids->ne[1] >= 32) {
+        int layer = -1;
+        if (std::sscanf(src->name, "blk.%d.", &layer) == 1) {
+            const int target = layer + lctx->cparams.moe_prefetch_ahead;
+            const int n_layer = (int) lctx->model.hparams.n_layer();
+            if (target >= 0 && target < n_layer) {
+                if ((int) st.prefetched.size() != n_layer) {
+                    st.prefetched.assign(lctx->model.hparams.n_layer(), false);
+                }
+                if (!st.prefetched[target]) {
+                    st.prefetched[target] = true;
+                    llama_memory_ranges ranges;
+                    for (const char * kind : {"gate", "gate_up", "up", "down"}) {
+                        const std::string name = "blk." + std::to_string(target) + ".ffn_" + kind + "_exps.weight";
+                        const ggml_tensor * tensor = lctx->model.get_tensor(name.c_str());
+                        if (tensor && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
+                            ranges.push_back({tensor->data, ggml_nbytes(tensor)});
+                        }
+                    }
+                    llama_prefetch(std::move(ranges));
+                }
+            }
+        }
+    }
+
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
@@ -4005,6 +4034,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_prefetch_ahead          =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

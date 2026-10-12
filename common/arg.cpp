@@ -2828,6 +2828,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HOST_RESIDENT_PLAN"));
     add_opt(common_arg(
+        {"--moe-prefetch-ahead"}, "N",
+        "asynchronously prefetch CPU MoE tensors N layers ahead during batched evaluation (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefetch_ahead = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_AHEAD"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

@@ -1752,6 +1752,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_cache_size       = params.moe_cache_size;
     cparams.moe_cache_cpu_misses = params.moe_cache_cpu_misses;
+    cparams.moe_prefetch_ahead    = params.moe_prefetch_ahead;
 
     return cparams;
 }
