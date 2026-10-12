@@ -32,9 +32,11 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1244,6 +1246,7 @@ struct llama_model::impl {
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
+    llama_mlocks mlock_moe_resident;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -2007,6 +2010,117 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // Keep a routing-selected subset of host MoE experts unevictable. This is
+    // deliberately separate from --load-mode mmap+mlock, which locks every host
+    // weight and is not viable for models whose CPU experts exceed RAM.
+    if (params.moe_host_resident_size > 0) {
+        if (!params.moe_host_resident_plan || !params.moe_host_resident_plan[0]) {
+            LLAMA_LOG_ERROR("%s: --moe-host-resident-mib requires --moe-host-resident-plan\n", __func__);
+            return false;
+        }
+
+        struct resident_key { int layer; int expert; };
+        std::vector<resident_key> ranked;
+        std::set<std::pair<int, int>> seen;
+        std::ifstream plan(params.moe_host_resident_plan);
+        if (!plan) {
+            LLAMA_LOG_ERROR("%s: cannot open MoE resident plan '%s'\n", __func__, params.moe_host_resident_plan);
+            return false;
+        }
+        std::string line;
+        while (std::getline(plan, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::istringstream row(line);
+            int layer = -1;
+            int expert = -1;
+            if (!(row >> layer >> expert) || layer < 0 || expert < 0) {
+                LLAMA_LOG_ERROR("%s: invalid MoE resident plan row: %s\n", __func__, line.c_str());
+                return false;
+            }
+            if (seen.emplace(layer, expert).second) {
+                ranked.push_back({layer, expert});
+            }
+        }
+
+        uint64_t available = UINT64_MAX;
+#ifdef __linux__
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key;
+        uint64_t value = 0;
+        std::string unit;
+        while (meminfo >> key >> value >> unit) {
+            if (key == "MemAvailable:") {
+                available = value*1024;
+                break;
+            }
+        }
+#endif
+        constexpr uint64_t reserve = 4ULL*1024*1024*1024;
+        const uint64_t safe_budget = available > reserve ? available - reserve : 0;
+        const size_t budget = (size_t) std::min<uint64_t>(params.moe_host_resident_size, safe_budget);
+        if (budget < params.moe_host_resident_size) {
+            LLAMA_LOG_WARN("%s: capping MoE resident budget from %.2f to %.2f GiB to reserve 4 GiB MemAvailable\n",
+                    __func__, params.moe_host_resident_size/(1024.0*1024.0*1024.0), budget/(1024.0*1024.0*1024.0));
+        }
+
+        std::map<int, std::vector<ggml_tensor *>> expert_tensors;
+        for (const auto & [name, tensor] : tensors_by_name) {
+            int layer = -1;
+            if (std::sscanf(name.c_str(), "blk.%d.ffn_", &layer) != 1 ||
+                    name.find("_exps.weight") == std::string::npos || tensor->ne[2] <= 1 ||
+                    tensor->buffer == nullptr || !ggml_backend_buffer_is_host(tensor->buffer)) {
+                continue;
+            }
+            expert_tensors[layer].push_back(tensor);
+        }
+
+        size_t locked = 0;
+        size_t n_experts_locked = 0;
+        for (const auto & item : ranked) {
+            auto it = expert_tensors.find(item.layer);
+            if (it == expert_tensors.end()) {
+                continue;
+            }
+            size_t group_size = 0;
+            bool valid = true;
+            for (const ggml_tensor * tensor : it->second) {
+                if (item.expert >= tensor->ne[2]) {
+                    valid = false;
+                    break;
+                }
+                group_size += tensor->nb[2];
+            }
+            if (!valid || group_size == 0 || group_size > budget - std::min(budget, locked)) {
+                continue;
+            }
+
+            const size_t locks_before = pimpl->mlock_moe_resident.size();
+            size_t group_locked = 0;
+            for (ggml_tensor * tensor : it->second) {
+                auto lock = std::make_unique<llama_mlock>();
+                lock->init((uint8_t *) tensor->data + (size_t) item.expert*tensor->nb[2]);
+                lock->grow_to(tensor->nb[2]);
+                group_locked += lock->locked_size();
+                pimpl->mlock_moe_resident.emplace_back(std::move(lock));
+            }
+            if (group_locked < group_size) {
+                pimpl->mlock_moe_resident.resize(locks_before);
+                LLAMA_LOG_WARN("%s: stopped after an mlock failure; check RLIMIT_MEMLOCK\n", __func__);
+                break;
+            }
+            locked += group_locked;
+            n_experts_locked++;
+            if (locked >= budget) {
+                break;
+            }
+        }
+        LLAMA_LOG_INFO("%s: MoE host resident locked %.2f GiB across %zu layer/expert pairs (requested %.2f GiB)\n",
+                __func__, locked/(1024.0*1024.0*1024.0), n_experts_locked,
+                params.moe_host_resident_size/(1024.0*1024.0*1024.0));
     }
 
     if (use_mmap_buffer) {
@@ -3000,6 +3114,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_host_resident_size      =*/ 0,
+        /*.moe_host_resident_plan      =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

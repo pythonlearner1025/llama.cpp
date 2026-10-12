@@ -131,12 +131,14 @@ static std::vector<script_turn> read_script(const fs::path & path) {
 int main(int argc, char ** argv) try {
     std::string script_path, output_path, prefill_base, prefill_append, prefill_cache, teacher_forced, teacher_script, teacher_raw;
     std::vector<std::string> prefill_appends, prefill_outputs;
-    int session_id = 0; bool capture_enabled = true;
+    int session_id = 0; bool capture_enabled = true; bool prefill_benchmark = false;
     std::vector<char *> pass; pass.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--benchmark-no-capture") {
             capture_enabled = false;
+        } else if (a == "--prefill-benchmark") {
+            prefill_benchmark = true;
         } else if ((a == "--session-script" || a == "--output" || a == "--session-id" ||
                     a == "--prefill-base" || a == "--prefill-append" || a == "--prefill-cache" ||
                     a == "--teacher-forced" || a == "--teacher-script" || a == "--teacher-raw") && i + 1 < argc) {
@@ -366,13 +368,27 @@ int main(int argc, char ** argv) try {
                 eval_range(0, prefix);
             }
             llama_synchronize(ctx);
-            if (!llama_router_log_enable(ctx, prefill_outputs[job].c_str(), params.router_log_max_gb)) {
+            if (!prefill_benchmark && !llama_router_log_enable(ctx, prefill_outputs[job].c_str(), params.router_log_max_gb)) {
                 throw std::runtime_error("failed to enable router logging after base prefill");
             }
+            const auto append_start = std::chrono::steady_clock::now();
             eval_range(prefix, all_tokens.size());
-            llama_router_log_disable(ctx);
-            std::fprintf(stderr, "logged %zu appended tokens after %zu base tokens to %s\n",
-                         all_tokens.size() - prefix, prefix, prefill_outputs[job].c_str());
+            llama_synchronize(ctx);
+            const double append_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - append_start).count();
+            if (prefill_benchmark) {
+                std::ofstream metrics(prefill_outputs[job]);
+                metrics << "{\"base_tokens\":" << prefix << ",\"append_tokens\":"
+                        << all_tokens.size() - prefix << ",\"append_seconds\":" << append_seconds
+                        << ",\"append_tokens_per_second\":"
+                        << (all_tokens.size() - prefix)/append_seconds << "}\n";
+                std::fprintf(stderr, "benchmarked %zu appended tokens after %zu base tokens in %.3f s to %s\n",
+                             all_tokens.size() - prefix, prefix, append_seconds, prefill_outputs[job].c_str());
+            } else {
+                llama_router_log_disable(ctx);
+                std::fprintf(stderr, "logged %zu appended tokens after %zu base tokens to %s\n",
+                             all_tokens.size() - prefix, prefix, prefill_outputs[job].c_str());
+            }
         }
         init.reset();
         llama_backend_free();
@@ -389,7 +405,10 @@ int main(int argc, char ** argv) try {
     common_batch batch(ctx);
     llama_sampler * greedy = llama_sampler_init_greedy();
     auto eval = [&](const std::vector<llama_token> & tok, bool decode, int turn) {
-        const size_t eval_batch = decode ? 1 : 128;
+        // Small chunks are needed only while materializing every routing tensor.
+        // Timing-only replays should exercise the configured physical ubatch;
+        // 128-token chunks otherwise rescan nearly every CPU expert repeatedly.
+        const size_t eval_batch = decode ? 1 : (capture_enabled ? 128 : params.n_ubatch);
         for (size_t off = 0; off < tok.size(); off += eval_batch) {
             size_t n = std::min<size_t>(eval_batch, tok.size() - off);
             batch.clear();

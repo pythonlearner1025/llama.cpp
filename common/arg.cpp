@@ -2811,6 +2811,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_MISSES"));
     add_opt(common_arg(
+        {"--moe-host-resident-mib"}, "N",
+        "mlock up to N MiB of CPU MoE expert weights selected by --moe-host-resident-plan (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_host_resident_size = (size_t) value*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOST_RESIDENT_MIB"));
+    add_opt(common_arg(
+        {"--moe-host-resident-plan"}, "FNAME",
+        "ranked host-resident expert plan: one 'layer expert [score]' record per line",
+        [](common_params & params, const std::string & value) {
+            params.moe_host_resident_plan = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOST_RESIDENT_PLAN"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

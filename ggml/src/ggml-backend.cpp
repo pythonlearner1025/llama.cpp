@@ -20,8 +20,58 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
+
+struct ggml_moe_copy_trace_snapshot {
+    int64_t time_us;
+    uint64_t read_bytes;
+    int64_t minor_faults;
+    int64_t major_faults;
+};
+
+static ggml_moe_copy_trace_snapshot ggml_moe_copy_trace_now() {
+    ggml_moe_copy_trace_snapshot out = {};
+    out.time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+#ifdef __linux__
+    if (FILE * f = fopen("/proc/self/io", "r")) {
+        char key[64];
+        unsigned long long value;
+        while (fscanf(f, "%63s %llu", key, &value) == 2) {
+            if (strcmp(key, "read_bytes:") == 0) out.read_bytes = value;
+        }
+        fclose(f);
+    }
+    struct rusage usage = {};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        out.minor_faults = usage.ru_minflt;
+        out.major_faults = usage.ru_majflt;
+    }
+#endif
+    return out;
+}
+
+static void ggml_moe_copy_trace_full(const ggml_tensor * input, const ggml_moe_copy_trace_snapshot & begin) {
+    const char * path = getenv("LLAMA_MOE_COPY_TRACE");
+    if (!path || !path[0] || !strstr(input->name, "_exps")) return;
+    const auto end = ggml_moe_copy_trace_now();
+    if (FILE * f = fopen(path, "a")) {
+        fprintf(f, "{\"mode\":\"full\",\"tensor\":\"%s\",\"tokens\":0,\"used_experts\":0,"
+                "\"bytes\":%zu,\"start_us\":%lld,\"duration_us\":%lld,\"storage_read_bytes\":%llu,"
+                "\"minor_faults\":%lld,\"major_faults\":%lld}\n", input->name, ggml_nbytes(input),
+                (long long) begin.time_us, (long long) (end.time_us - begin.time_us),
+                (unsigned long long) (end.read_bytes - begin.read_bytes),
+                (long long) (end.minor_faults - begin.minor_faults),
+                (long long) (end.major_faults - begin.major_faults));
+        fclose(f);
+    }
+}
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1813,6 +1863,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+    const bool trace_moe = getenv("LLAMA_MOE_COPY_TRACE") != NULL && strstr(input->name, "_exps") != NULL;
+    const auto trace_begin = trace_moe ? ggml_moe_copy_trace_now() : ggml_moe_copy_trace_snapshot {};
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1847,6 +1899,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
+    }
+    if (trace_moe) {
+        ggml_moe_copy_trace_full(input, trace_begin);
     }
 }
 
