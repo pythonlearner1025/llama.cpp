@@ -81,6 +81,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.response_fields = json_value(data, "response_fields", std::vector<std::string>());
         }));
 
+    add((new field_json("teacher_forced_tokens"))
+        ->set_desc("Evaluation-only: fixed tokens whose pre-sampling probabilities are reported")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.teacher_forced_tokens = json_value(
+                    data, "teacher_forced_tokens", std::vector<llama_token>());
+        }));
+
 
     //
     // Sampling params

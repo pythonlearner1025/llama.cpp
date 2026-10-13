@@ -3130,6 +3130,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // Opt-in profiling for Monet's CPU-MoE study. Disabled by default. The
+    // extra barrier after each record is intentionally confined to profiling
+    // runs so the per-thread slots cannot be overwritten by the next node.
+    static double profile_compute_us[GGML_MAX_N_THREADS];
+    static FILE * profile_file = NULL;
+    static bool profile_checked = false;
+    const char * profile_path = getenv("GGML_CPU_PROFILE");
+    const bool profile_enabled = profile_path && profile_path[0];
+    if (state->ith == 0 && !profile_checked) {
+        if (profile_enabled) {
+            profile_file = fopen(profile_path, "w");
+            if (profile_file) {
+                fprintf(profile_file, "graph,node,op,name,threads,wall_us,sum_compute_us,max_compute_us,min_compute_us,thread0_wait_us\n");
+                setvbuf(profile_file, NULL, _IOLBF, 0);
+            }
+        }
+        profile_checked = true;
+    }
+    if (profile_enabled) {
+        ggml_barrier(state->threadpool);
+    }
+    static uint64_t profile_graph = 0;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3141,6 +3164,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        const int64_t profile_start = profile_file ? ggml_time_us() : 0;
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -3157,7 +3182,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        const int64_t profile_compute_end = profile_file ? ggml_time_us() : 0;
+        if (profile_file) {
+            profile_compute_us[state->ith] = (double) (profile_compute_end - profile_start);
+        }
+
         if (node_n + 1 < cgraph->n_nodes) {
+            ggml_barrier(state->threadpool);
+        }
+
+        if (profile_file) {
+            const int64_t profile_end = ggml_time_us();
+            if (state->ith == 0) {
+                double sum = 0.0;
+                double maximum = 0.0;
+                double minimum = profile_compute_us[0];
+                for (int i = 0; i < params.nth; ++i) {
+                    sum += profile_compute_us[i];
+                    maximum = MAX(maximum, profile_compute_us[i]);
+                    minimum = MIN(minimum, profile_compute_us[i]);
+                }
+                fprintf(profile_file, "%" PRIu64 ",%d,%s,%s,%d,%" PRId64 ",%.0f,%.0f,%.0f,%" PRId64 "\n",
+                        profile_graph, node_n, ggml_op_name(node->op), node->name,
+                        params.nth, profile_end - profile_start, sum, maximum, minimum,
+                        profile_end - profile_compute_end);
+            }
             ggml_barrier(state->threadpool);
         }
     }
@@ -3169,6 +3218,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+    if (profile_file && state->ith == 0) {
+        ++profile_graph;
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
