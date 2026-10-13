@@ -1689,6 +1689,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_host         = params.no_host;
     mparams.moe_host_resident_size = params.moe_host_resident_size;
     mparams.moe_host_resident_plan = params.moe_host_resident_plan.empty() ? nullptr : params.moe_host_resident_plan.c_str();
+    mparams.moe_host_resident_pinned = params.moe_host_resident_pinned;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

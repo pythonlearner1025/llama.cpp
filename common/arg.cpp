@@ -2828,6 +2828,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HOST_RESIDENT_PLAN"));
     add_opt(common_arg(
+        {"--moe-host-resident-pinned"},
+        "copy the selected resident experts into one anonymous THP arena and register it for DMA (default: disabled)",
+        [](common_params & params) {
+            params.moe_host_resident_pinned = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOST_RESIDENT_PINNED"));
+    add_opt(common_arg(
         {"--moe-prefetch-ahead"}, "N",
         "asynchronously prefetch CPU MoE tensors N layers ahead during batched evaluation (default: 0, disabled)",
         [](common_params & params, int value) {

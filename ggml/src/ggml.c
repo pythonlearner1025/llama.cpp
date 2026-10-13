@@ -1827,6 +1827,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.view_src     =*/ view_src,
         /*.view_offs    =*/ view_offs,
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
+        /*.expert_data  =*/ NULL,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
         /*.padding      =*/ { 0 },

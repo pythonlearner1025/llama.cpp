@@ -62,7 +62,8 @@ static moe_copy_trace_snapshot moe_copy_trace_now() {
 
 static void moe_copy_trace_write(const char * mode, const ggml_tensor * src, int64_t tokens,
         int64_t used, size_t bytes, const moe_copy_trace_snapshot & begin,
-        const std::vector<size_t> * chunks = nullptr) {
+        const std::vector<size_t> * chunks = nullptr,
+        size_t resident_bytes = 0, size_t nonresident_bytes = 0) {
     const char * path = std::getenv("LLAMA_MOE_COPY_TRACE");
     if (!path || !path[0]) {
         return;
@@ -73,10 +74,11 @@ static void moe_copy_trace_write(const char * mode, const ggml_tensor * src, int
                 "{\"mode\":\"%s\",\"tensor\":\"%s\",\"tokens\":%" PRId64
                 ",\"used_experts\":%" PRId64 ",\"bytes\":%zu,\"start_us\":%" PRId64
                 ",\"duration_us\":%" PRId64 ",\"storage_read_bytes\":%" PRIu64
-                ",\"minor_faults\":%" PRId64 ",\"major_faults\":%" PRId64 ",\"copy_chunks\":[",
+                ",\"minor_faults\":%" PRId64 ",\"major_faults\":%" PRId64
+                ",\"resident_bytes\":%zu,\"nonresident_bytes\":%zu,\"copy_chunks\":[",
                 mode, src->name, tokens, used, bytes, begin.time_us, end.time_us - begin.time_us,
                 end.read_bytes - begin.read_bytes, end.minor_faults - begin.minor_faults,
-                end.major_faults - begin.major_faults);
+                end.major_faults - begin.major_faults, resident_bytes, nonresident_bytes);
         if (chunks) {
             for (size_t i = 0; i < chunks->size(); ++i) {
                 std::fprintf(f, "%s%zu", i ? "," : "", (*chunks)[i]);
@@ -2830,6 +2832,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // group consecutive experts and copy them together
     size_t copied_bytes = 0;
+    size_t resident_bytes = 0;
+    size_t nonresident_bytes = 0;
     int64_t used_experts = 0;
     std::vector<size_t> copy_chunks;
     for (int64_t first = 0; first < n_expert; ) {
@@ -2843,19 +2847,38 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
         used_experts += last - first + 1;
 
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
+        // The experts in the MoE cache are copied from device memory. Resident
+        // host experts use their individually addressable pinned-arena pointer;
+        // other experts retain the grouped mmap upload path.
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
-            if (n == 0) {
-                e++;
+        for (int64_t e = first; e <= last; ) {
+            int64_t n = lctx->moe_cache ? lctx->moe_cache->copy_experts(backend, src, dst, e, last) : 0;
+            if (n > 0) {
+                if (next < e) {
+                    const size_t bytes = (e - next)*expert_size;
+                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, bytes);
+                    nonresident_bytes += bytes;
+                    copy_chunks.push_back(bytes);
+                }
+                e += n;
+                next = e;
                 continue;
             }
-            if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+            if (src->expert_data && src->expert_data[e]) {
+                if (next < e) {
+                    const size_t bytes = (e - next)*expert_size;
+                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, bytes);
+                    nonresident_bytes += bytes;
+                    copy_chunks.push_back(bytes);
+                }
+                ggml_backend_tensor_set_async(backend, dst, src->expert_data[e], e*expert_size, expert_size);
+                resident_bytes += expert_size;
+                copy_chunks.push_back(expert_size);
+                e++;
+                next = e;
+                continue;
             }
-            e   += n;
-            next = e;
+            e++;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
@@ -2864,7 +2887,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
-            copied_bytes += size;
+            nonresident_bytes += size;
             copy_chunks.push_back(size);
         }
 
@@ -2872,7 +2895,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     if (trace) {
-        moe_copy_trace_write("selected", src, ids->ne[1], used_experts, copied_bytes, trace_begin, &copy_chunks);
+        copied_bytes = resident_bytes + nonresident_bytes;
+        moe_copy_trace_write("selected", src, ids->ne[1], used_experts, copied_bytes, trace_begin, &copy_chunks,
+                resident_bytes, nonresident_bytes);
     }
 
     return true;
