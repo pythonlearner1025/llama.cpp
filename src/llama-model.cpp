@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -41,6 +42,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1230,7 +1236,16 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        if (moe_resident_arena) {
+            if (moe_resident_unregister) {
+                moe_resident_unregister(moe_resident_arena);
+            }
+#ifdef __linux__
+            munmap(moe_resident_arena, moe_resident_arena_size);
+#endif
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1247,6 +1262,14 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
     llama_mlocks mlock_moe_resident;
+
+    // The pointer tables are attached to ggml_tensor::expert_data. They are a
+    // stable interface for CPU MUL_MAT_ID and host-to-device upload code; arena
+    // packing remains private to the loader.
+    std::vector<std::unique_ptr<void * []>> moe_resident_tables;
+    void * moe_resident_arena = nullptr;
+    size_t moe_resident_arena_size = 0;
+    void (*moe_resident_unregister)(void *) = nullptr;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -2085,49 +2108,155 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         size_t locked = 0;
         size_t n_experts_locked = 0;
-        for (const auto & item : ranked) {
-            auto it = expert_tensors.find(item.layer);
-            if (it == expert_tensors.end()) {
-                continue;
-            }
-            size_t group_size = 0;
-            bool valid = true;
-            for (const ggml_tensor * tensor : it->second) {
-                if (item.expert >= tensor->ne[2]) {
-                    valid = false;
+
+        std::vector<resident_key> selected;
+        if (params.moe_host_resident_pinned) {
+            for (const auto & item : ranked) {
+                auto it = expert_tensors.find(item.layer);
+                if (it == expert_tensors.end()) {
+                    continue;
+                }
+                size_t group_size = 0;
+                bool valid = true;
+                for (const ggml_tensor * tensor : it->second) {
+                    if (item.expert >= tensor->ne[2]) {
+                        valid = false;
+                        break;
+                    }
+                    group_size += tensor->nb[2];
+                }
+                if (!valid || group_size == 0 || group_size > budget - std::min(budget, locked)) {
+                    continue;
+                }
+                selected.push_back(item);
+                locked += group_size;
+                if (locked >= budget) {
                     break;
                 }
-                group_size += tensor->nb[2];
-            }
-            if (!valid || group_size == 0 || group_size > budget - std::min(budget, locked)) {
-                continue;
             }
 
-            const size_t locks_before = pimpl->mlock_moe_resident.size();
-            size_t group_locked = 0;
-            bool group_ok = true;
-            for (ggml_tensor * tensor : it->second) {
-                auto lock = std::make_unique<llama_mlock>();
-                lock->init((uint8_t *) tensor->data + (size_t) item.expert*tensor->nb[2]);
-                lock->grow_to(tensor->nb[2]);
-                group_ok = group_ok && lock->succeeded();
-                group_locked += lock->locked_size();
-                pimpl->mlock_moe_resident.emplace_back(std::move(lock));
+#ifdef __linux__
+            const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+            const size_t arena_size = locked ? ((locked + page_size - 1)/page_size)*page_size : 0;
+            void * arena = arena_size ? mmap(nullptr, arena_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : nullptr;
+            if (arena_size && arena == MAP_FAILED) {
+                LLAMA_LOG_ERROR("%s: failed to allocate %.2f GiB MoE resident arena: %s\n",
+                        __func__, arena_size/(1024.0*1024.0*1024.0), std::strerror(errno));
+                return false;
             }
-            if (!group_ok) {
-                pimpl->mlock_moe_resident.resize(locks_before);
-                LLAMA_LOG_WARN("%s: stopped after an mlock failure; check RLIMIT_MEMLOCK\n", __func__);
-                break;
+            if (arena_size && madvise(arena, arena_size, MADV_HUGEPAGE) != 0) {
+                LLAMA_LOG_WARN("%s: MADV_HUGEPAGE failed for MoE resident arena: %s\n", __func__, std::strerror(errno));
             }
-            locked += group_locked;
-            n_experts_locked++;
-            if (locked >= budget) {
-                break;
+            pimpl->moe_resident_arena = arena;
+            pimpl->moe_resident_arena_size = arena_size;
+
+            for (auto & [layer, tensors] : expert_tensors) {
+                GGML_UNUSED(layer);
+                for (ggml_tensor * tensor : tensors) {
+                    auto table = std::make_unique<void * []>((size_t) tensor->ne[2]);
+                    std::fill_n(table.get(), (size_t) tensor->ne[2], nullptr);
+                    tensor->expert_data = table.get();
+                    pimpl->moe_resident_tables.emplace_back(std::move(table));
+                }
+            }
+
+            uint8_t * cursor = static_cast<uint8_t *>(arena);
+            for (const auto & item : selected) {
+                for (ggml_tensor * tensor : expert_tensors.at(item.layer)) {
+                    const size_t size = tensor->nb[2];
+                    const uint8_t * source = static_cast<const uint8_t *>(tensor->data) + (size_t) item.expert*size;
+                    std::memcpy(cursor, source, size);
+                    tensor->expert_data[item.expert] = cursor;
+                    cursor += size;
+
+                    // The arena is now the only resident copy. Discard the
+                    // file-backed pages, including partial boundary pages;
+                    // non-resident neighbors may fault them back normally.
+                    if (use_mmap_buffer) {
+                        const uintptr_t first = (uintptr_t) source & ~(uintptr_t) (page_size - 1);
+                        const uintptr_t last  = ((uintptr_t) source + size + page_size - 1) & ~(uintptr_t) (page_size - 1);
+                        (void) madvise((void *) first, last - first, MADV_DONTNEED);
+                    }
+                }
+                n_experts_locked++;
+            }
+
+            using register_fn = bool (*)(void *, size_t);
+            using unregister_fn = void (*)(void *);
+            bool registered = arena_size == 0;
+            for (size_t i = 0; !registered && i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto register_host = (register_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer_force");
+                auto unregister_host = (unregister_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer_force");
+                if (register_host && unregister_host && register_host(arena, arena_size)) {
+                    registered = true;
+                    pimpl->moe_resident_unregister = unregister_host;
+                }
+            }
+            if (!registered) {
+                LLAMA_LOG_ERROR("%s: no GPU backend accepted the %.2f GiB MoE resident arena for DMA\n",
+                        __func__, arena_size/(1024.0*1024.0*1024.0));
+                return false;
+            }
+            LLAMA_LOG_INFO("%s: MoE host resident pinned %.2f GiB across %zu layer/expert pairs (requested %.2f GiB)\n",
+                    __func__, locked/(1024.0*1024.0*1024.0), n_experts_locked,
+                    params.moe_host_resident_size/(1024.0*1024.0*1024.0));
+#else
+            LLAMA_LOG_ERROR("%s: --moe-host-resident-pinned is only implemented on Linux\n", __func__);
+            return false;
+#endif
+        } else {
+            for (const auto & item : ranked) {
+                auto it = expert_tensors.find(item.layer);
+                if (it == expert_tensors.end()) {
+                    continue;
+                }
+                size_t group_size = 0;
+                bool valid = true;
+                for (const ggml_tensor * tensor : it->second) {
+                    if (item.expert >= tensor->ne[2]) {
+                        valid = false;
+                        break;
+                    }
+                    group_size += tensor->nb[2];
+                }
+                if (!valid || group_size == 0 || group_size > budget - std::min(budget, locked)) {
+                    continue;
+                }
+
+                const size_t locks_before = pimpl->mlock_moe_resident.size();
+                size_t group_locked = 0;
+                bool group_ok = true;
+                for (ggml_tensor * tensor : it->second) {
+                    auto lock = std::make_unique<llama_mlock>();
+                    lock->init((uint8_t *) tensor->data + (size_t) item.expert*tensor->nb[2]);
+                    lock->grow_to(tensor->nb[2]);
+                    group_ok = group_ok && lock->succeeded();
+                    group_locked += lock->locked_size();
+                    pimpl->mlock_moe_resident.emplace_back(std::move(lock));
+                }
+                if (!group_ok) {
+                    pimpl->mlock_moe_resident.resize(locks_before);
+                    LLAMA_LOG_WARN("%s: stopped after an mlock failure; check RLIMIT_MEMLOCK\n", __func__);
+                    break;
+                }
+                locked += group_locked;
+                n_experts_locked++;
+                if (locked >= budget) {
+                    break;
+                }
             }
         }
-        LLAMA_LOG_INFO("%s: MoE host resident locked %.2f GiB across %zu layer/expert pairs (requested %.2f GiB)\n",
-                __func__, locked/(1024.0*1024.0*1024.0), n_experts_locked,
-                params.moe_host_resident_size/(1024.0*1024.0*1024.0));
+        if (!params.moe_host_resident_pinned) {
+            LLAMA_LOG_INFO("%s: MoE host resident locked %.2f GiB across %zu layer/expert pairs (requested %.2f GiB)\n",
+                    __func__, locked/(1024.0*1024.0*1024.0), n_experts_locked,
+                    params.moe_host_resident_size/(1024.0*1024.0*1024.0));
+        }
     }
 
     if (use_mmap_buffer) {
@@ -3129,6 +3258,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_host_resident_pinned    =*/ false,
     };
 
     return result;

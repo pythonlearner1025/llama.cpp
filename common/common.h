@@ -602,6 +602,7 @@ struct common_params {
     int32_t moe_copy_whole_min_used_pct = 101; // one contiguous expert upload at/above this density; 101 disables
     size_t moe_host_resident_size = 0; // fixed, mlocked host expert budget in bytes
     std::string moe_host_resident_plan; // ranked "layer expert [score]" plan
+    bool moe_host_resident_pinned = false; // anonymous THP + backend DMA registration
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

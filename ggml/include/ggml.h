@@ -709,11 +709,18 @@ extern "C" {
 
         void * data;
 
+        // Optional per-expert host storage for expert tensors. Entry i points
+        // at the first byte of expert i, or is NULL when that expert uses the
+        // tensor's ordinary data + i*nb[2] storage. The table and pointed-to
+        // storage are owned by the model. MUL_MAT_ID implementations and
+        // backend upload paths may use this without knowing the arena layout.
+        void ** expert_data;
+
         char name[GGML_MAX_NAME];
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        char padding[16];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
