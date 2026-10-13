@@ -1741,6 +1741,174 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+// Decode-sized routed FFN specialized for Qwen3.8-Flash-Next. The surrounding
+// graph matcher below deliberately keeps this kernel narrow: two IQ2_S/IQ3_S
+// input projections, SWIGLU, and one IQ4_NL output projection. Keeping the four
+// graph nodes in this one invocation lets the workers share input quantization
+// and route descriptors and, more importantly, pool the tails of all routes.
+struct ggml_cpu_moe_route {
+    int32_t expert;
+    int32_t slot;
+    int32_t token;
+
+    const char * gate_w;
+    const char * up_w;
+    const char * down_w;
+
+    float * gate_out;
+    float * up_out;
+    float * act;
+    float * down_out;
+};
+
+static const char * ggml_cpu_moe_expert_ptr(const struct ggml_tensor * tensor, int32_t expert) {
+    return tensor->expert_data && tensor->expert_data[expert]
+        ? (const char *) tensor->expert_data[expert]
+        : (const char *) tensor->data + expert*tensor->nb[2];
+}
+
+static void ggml_compute_forward_moe_qwen_fused(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * gate,
+              struct ggml_tensor * up,
+              struct ggml_tensor * glu,
+              struct ggml_tensor * down) {
+    const struct ggml_tensor * gate_w = gate->src[0];
+    const struct ggml_tensor * up_w   = up->src[0];
+    const struct ggml_tensor * down_w = down->src[0];
+    const struct ggml_tensor * input  = gate->src[1];
+    const struct ggml_tensor * ids    = gate->src[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t n_routes = n_used*n_tokens;
+    const int64_t n_embd   = gate_w->ne[0];
+    const int64_t n_ff     = gate_w->ne[1];
+
+    const enum ggml_type input_qtype = type_traits_cpu[gate_w->type].vec_dot_type;
+    const enum ggml_type act_qtype   = type_traits_cpu[down_w->type].vec_dot_type;
+    const size_t input_qrow = ggml_row_size(input_qtype, n_embd);
+    const size_t act_qrow   = ggml_row_size(act_qtype, n_ff);
+    const size_t qbytes     = MAX(input_qrow*n_tokens, act_qrow*n_routes);
+
+    void * wdata_cur = params->wdata;
+    char * qdata = incr_ptr_aligned(&wdata_cur, qbytes, 64);
+    struct ggml_cpu_moe_route * routes =
+        incr_ptr_aligned(&wdata_cur, n_routes*sizeof(*routes), 64);
+    atomic_int * gate_task = incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE, CACHE_LINE_SIZE);
+    atomic_int * down_task = incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE, CACHE_LINE_SIZE);
+    GGML_ASSERT(params->wsize >= (size_t) ((char *) wdata_cur - (char *) params->wdata));
+
+    if (ith == 0) {
+        int64_t route = 0;
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t slot = 0; slot < n_used; ++slot, ++route) {
+                const int32_t expert = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + slot*ids->nb[0]);
+                struct ggml_cpu_moe_route * r = &routes[route];
+                r->expert  = expert;
+                r->slot    = (int32_t) slot;
+                r->token   = (int32_t) token;
+                r->gate_w  = expert >= 0 ? ggml_cpu_moe_expert_ptr(gate_w, expert) : NULL;
+                r->up_w    = expert >= 0 ? ggml_cpu_moe_expert_ptr(up_w,   expert) : NULL;
+                r->down_w  = expert >= 0 ? ggml_cpu_moe_expert_ptr(down_w, expert) : NULL;
+                r->gate_out = (float *) ((char *) gate->data + slot*gate->nb[1] + token*gate->nb[2]);
+                r->up_out   = (float *) ((char *) up->data   + slot*up->nb[1]   + token*up->nb[2]);
+                r->act      = (float *) ((char *) glu->data  + slot*glu->nb[1]  + token*glu->nb[2]);
+                r->down_out = (float *) ((char *) down->data + slot*down->nb[1] + token*down->nb[2]);
+            }
+        }
+        atomic_store_explicit(gate_task, 0, memory_order_relaxed);
+        atomic_store_explicit(down_task, 0, memory_order_relaxed);
+    }
+
+    // IQ2_S/IQ3_S gate and up use the same Q8 input representation. Quantize each
+    // token once, partitioning blocks exactly as the canonical MUL_MAT_ID path.
+    const size_t input_bs = ggml_blck_size(input_qtype);
+    const int64_t input_b0 = (ith*(n_embd/input_bs))/nth;
+    const int64_t input_b1 = ((ith + 1)*(n_embd/input_bs))/nth;
+    ggml_from_float_t input_from_float = type_traits_cpu[input_qtype].from_float;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        const float * src = (const float *) ((const char *) input->data + token*input->nb[2]);
+        input_from_float(src + input_b0*input_bs,
+                         qdata + token*input_qrow + input_b0*ggml_type_size(input_qtype),
+                         (input_b1 - input_b0)*input_bs);
+    }
+    ggml_barrier(params->threadpool);
+
+    // A task streams a gate row block and then its matching up block. This
+    // keeps long sequential reads without adding a gate/up phase barrier; the
+    // same owner applies SWIGLU immediately afterward.
+    // One routed row is a GEMV. Sixty-four output rows amortize the shared
+    // atomic queue while still exposing 100 gate/up and 400 down tasks for the
+    // usual ten-expert decode token.
+    const int64_t row_chunk = 64;
+    const int64_t gate_chunks = (n_ff + row_chunk - 1)/row_chunk;
+    const int64_t gate_tasks = n_routes*gate_chunks;
+    ggml_vec_dot_t gate_dot = type_traits_cpu[gate_w->type].vec_dot;
+    for (;;) {
+        const int task = atomic_fetch_add_explicit(gate_task, 1, memory_order_relaxed);
+        if (task >= gate_tasks) {
+            break;
+        }
+        struct ggml_cpu_moe_route * r = &routes[task/gate_chunks];
+        const int64_t row0 = (task % gate_chunks)*row_chunk;
+        const int64_t row1 = MIN(row0 + row_chunk, n_ff);
+        if (r->expert < 0) {
+            memset(r->gate_out + row0, 0, (row1 - row0)*sizeof(float));
+            memset(r->up_out   + row0, 0, (row1 - row0)*sizeof(float));
+            memset(r->act      + row0, 0, (row1 - row0)*sizeof(float));
+            continue;
+        }
+        const char * q = qdata + r->token*input_qrow;
+        for (int64_t row = row0; row < row1; ++row) {
+            gate_dot(n_embd, &r->gate_out[row], 0, r->gate_w + row*gate_w->nb[1], 0, q, 0, 1);
+        }
+        for (int64_t row = row0; row < row1; ++row) {
+            gate_dot(n_embd, &r->up_out[row], 0, r->up_w + row*up_w->nb[1], 0, q, 0, 1);
+        }
+        ggml_vec_swiglu_f32((int) (row1 - row0), r->act + row0, r->gate_out + row0, r->up_out + row0);
+    }
+    ggml_barrier(params->threadpool);
+
+    // Reuse the quantization area now that gate/up are complete. Each routed
+    // activation is distinct, and is quantized once for the down projection.
+    const size_t act_bs = ggml_blck_size(act_qtype);
+    const int64_t act_b0 = (ith*(n_ff/act_bs))/nth;
+    const int64_t act_b1 = ((ith + 1)*(n_ff/act_bs))/nth;
+    ggml_from_float_t act_from_float = type_traits_cpu[act_qtype].from_float;
+    for (int64_t route = 0; route < n_routes; ++route) {
+        act_from_float(routes[route].act + act_b0*act_bs,
+                       qdata + route*act_qrow + act_b0*ggml_type_size(act_qtype),
+                       (act_b1 - act_b0)*act_bs);
+    }
+    ggml_barrier(params->threadpool);
+
+    // One global queue redistributes all down rows. The atomic queue is the
+    // dynamic tail stealing mechanism; no expert can strand idle workers.
+    const int64_t down_chunks = (n_embd + row_chunk - 1)/row_chunk;
+    const int64_t down_tasks = n_routes*down_chunks;
+    ggml_vec_dot_t down_dot = type_traits_cpu[down_w->type].vec_dot;
+    for (;;) {
+        const int task = atomic_fetch_add_explicit(down_task, 1, memory_order_relaxed);
+        if (task >= down_tasks) {
+            break;
+        }
+        struct ggml_cpu_moe_route * r = &routes[task/down_chunks];
+        const int64_t row0 = (task % down_chunks)*row_chunk;
+        const int64_t row1 = MIN(row0 + row_chunk, n_embd);
+        if (r->expert < 0) {
+            memset(r->down_out + row0, 0, (row1 - row0)*sizeof(float));
+            continue;
+        }
+        const char * q = qdata + (r - routes)*act_qrow;
+        for (int64_t row = row0; row < row1; ++row) {
+            down_dot(n_ff, &r->down_out[row], 0, r->down_w + row*down_w->nb[1], 0, q, 0, 1);
+        }
+    }
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -3069,6 +3237,67 @@ struct ggml_cplan ggml_graph_plan(
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_moe_fusion = true;
+
+static bool ggml_cpu_can_fuse_moe_qwen(const struct ggml_cgraph * cgraph, int node_n) {
+    if (!ggml_cpu_moe_fusion || node_n + 4 > cgraph->n_nodes) {
+        return false;
+    }
+
+    const enum ggml_op ops[] = {
+        GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID,
+    };
+    const int outputs[] = { 3 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_n, 4, ops, outputs, 1)) {
+        return false;
+    }
+
+    const struct ggml_tensor * gate = cgraph->nodes[node_n + 0];
+    const struct ggml_tensor * up   = cgraph->nodes[node_n + 1];
+    const struct ggml_tensor * glu  = cgraph->nodes[node_n + 2];
+    const struct ggml_tensor * down = cgraph->nodes[node_n + 3];
+    const struct ggml_tensor * gate_w = gate->src[0];
+    const struct ggml_tensor * up_w   = up->src[0];
+    const struct ggml_tensor * down_w = down->src[0];
+    const struct ggml_tensor * input  = gate->src[1];
+    const struct ggml_tensor * ids    = gate->src[2];
+
+    // Exact emitted subgraph: sibling gate/up projections, split SWIGLU, then
+    // down with the same expert IDs. Any scale, bias, LoRA, or view breaks this
+    // wiring and therefore takes the canonical path.
+    if (up->src[1] != input || up->src[2] != ids ||
+        glu->src[0] != gate || glu->src[1] != up ||
+        down->src[1] != glu || down->src[2] != ids ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+
+    const bool supported_gate = gate_w->type == GGML_TYPE_IQ3_S || gate_w->type == GGML_TYPE_IQ2_S;
+    if (!supported_gate || up_w->type != gate_w->type || down_w->type != GGML_TYPE_IQ4_NL ||
+        input->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+        gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || down->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (input->ne[0] != 2560 || input->ne[1] != 1 || input->ne[2] < 1 || input->ne[2] >= 32 ||
+        ids->ne[0] != 10 || ids->ne[1] != input->ne[2] ||
+        gate_w->ne[0] != 2560 || gate_w->ne[1] != 640 || gate_w->ne[2] < 10 ||
+        up_w->ne[0]   != 2560 || up_w->ne[1]   != 640 || up_w->ne[2]   != gate_w->ne[2] ||
+        down_w->ne[0] != 640  || down_w->ne[1] != 2560 || down_w->ne[2] != gate_w->ne[2]) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(input) || !ggml_is_contiguous(ids) ||
+        !ggml_is_contiguous_1(gate) || !ggml_is_contiguous_1(up) ||
+        !ggml_is_contiguous_1(glu) || !ggml_is_contiguous_1(down) ||
+        gate_w->nb[0] != ggml_type_size(gate_w->type) ||
+        up_w->nb[0]   != ggml_type_size(up_w->type) ||
+        down_w->nb[0] != ggml_type_size(down_w->type)) {
+        return false;
+    }
+
+    return type_traits_cpu[gate_w->type].vec_dot_type == type_traits_cpu[up_w->type].vec_dot_type;
+}
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3081,6 +3310,13 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cpu_can_fuse_moe_qwen(cgraph, node_n)) {
+        ggml_compute_forward_moe_qwen_fused(params,
+                cgraph->nodes[node_n + 0], cgraph->nodes[node_n + 1],
+                cgraph->nodes[node_n + 2], cgraph->nodes[node_n + 3]);
+        return 3;
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3991,6 +4227,8 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+            env = getenv("GGML_CPU_MOE_FUSION");
+            ggml_cpu_moe_fusion = (env == NULL || atoi(env) != 0);
         }
 
         is_first_call = false;

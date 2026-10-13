@@ -5670,6 +5670,51 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+// Monet decode-sized CPU MoE fusion. The row geometry, selected-expert count,
+// quant types, and 1..31-token boundary match Qwen3.8-Flash-Next. Tests use 16
+// logical experts instead of 512 so every token-count case remains lightweight;
+// expert addressing and strides are otherwise identical.
+struct test_mul_mat_id_moe_decode_fusion : public test_case {
+    const ggml_type gate_type;
+    const int64_t n_tokens;
+
+    test_mul_mat_id_moe_decode_fusion(ggml_type gate_type, int64_t n_tokens)
+        : gate_type(gate_type), n_tokens(n_tokens) {}
+
+    std::string vars() override { return VARS_TO_STR2(gate_type, n_tokens); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_MOE_DECODE_FUSION"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-7; }
+    uint64_t op_flops(ggml_tensor *) override { return 16ULL*1000*1000*1000; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_embd = 2560;
+        constexpr int64_t n_ff = 640;
+        constexpr int64_t n_experts = 16;
+        constexpr int64_t n_used = 10;
+
+        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, gate_type, n_embd, n_ff, n_experts);
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, gate_type, n_embd, n_ff, n_experts);
+        ggml_tensor * down_w = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ4_NL, n_ff, n_embd, n_experts);
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, input, ids);
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_w, input, ids);
+        ggml_tensor * act = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * out = ggml_mul_mat_id(ctx, down_w, act, ids);
+        ggml_set_name(gate, "ffn_moe_gate-test");
+        ggml_set_name(up,   "ffn_moe_up-test");
+        ggml_set_name(act,  "ffn_moe_swiglu-test");
+        ggml_set_name(out,  "ffn_moe_down-test");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 16, 0.25f);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -10963,6 +11008,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S }) {
+        for (int64_t n = 1; n < 32; ++n) {
+            test_cases.emplace_back(new test_mul_mat_id_moe_decode_fusion(type, n));
         }
     }
 
