@@ -1125,6 +1125,11 @@ struct csv_printer : public printer {
             "test_mode",
             "backend_reg_name",
             "backend_name",
+            "time_us",
+            "flops",
+            "bandwidth_gb_s",
+            "memory_kb",
+            "n_runs",
         };
     }
 
@@ -1655,6 +1660,12 @@ struct test_case {
             const size_t target_size_gpu = 32 * GB;
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+        }
+        // Routed-expert DRAM profiling must redraw IDs between operations.
+        // Duplicating the same op in one graph makes all copies reuse the same
+        // selected experts from cache and reports a fictitious bandwidth.
+        if (out->op == GGML_OP_MUL_MAT_ID) {
+            n_runs = 1;
         }
 
         // duplicate the op
@@ -12152,6 +12163,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // Monet Qwen3.8-Flash-Next one-token routed experts (512 total,
+    // top-10). Gate/up broadcast one hidden vector; down consumes one
+    // activation per selected expert. These are profiling-only additions.
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, true, 640, 1, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640));
 
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {

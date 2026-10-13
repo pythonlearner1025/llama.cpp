@@ -21,11 +21,15 @@
 #include <string.h>
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #ifdef __linux__
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 struct ggml_moe_copy_trace_snapshot {
@@ -2502,6 +2506,48 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
 
 // CPU backend - buffer
 
+#ifdef __linux__
+// Evaluation-only backing selector for the CPU MUL_MAT_ID micro-benchmark.
+// Normal builds/runs do not set GGML_CPU_BUFFER_BACKING and retain malloc.
+static std::mutex ggml_cpu_mapped_buffers_mutex;
+static std::unordered_map<void *, size_t> ggml_cpu_mapped_buffers;
+
+static void * ggml_cpu_profile_buffer_alloc(size_t size) {
+    const char * mode = getenv("GGML_CPU_BUFFER_BACKING");
+    if (!mode || (strcmp(mode, "file4k") != 0 && strcmp(mode, "anon-thp") != 0)) {
+        return NULL;
+    }
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    int fd = -1;
+    if (strcmp(mode, "file4k") == 0) {
+        char path[] = "/tmp/ggml-cpu-buffer-XXXXXX";
+        fd = mkstemp(path);
+        if (fd < 0) {
+            return NULL;
+        }
+        unlink(path);
+        if (ftruncate(fd, size) != 0) {
+            close(fd);
+            return NULL;
+        }
+        flags = MAP_SHARED;
+    }
+    void * data = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, fd, 0);
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (data == MAP_FAILED) {
+        return NULL;
+    }
+    if (strcmp(mode, "anon-thp") == 0) {
+        madvise(data, size, MADV_HUGEPAGE);
+    }
+    std::lock_guard<std::mutex> lock(ggml_cpu_mapped_buffers_mutex);
+    ggml_cpu_mapped_buffers[data] = size;
+    return data;
+}
+#endif
+
 static void * ggml_backend_cpu_buffer_get_base(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
     uintptr_t data = (uintptr_t)buffer->context;
@@ -2516,6 +2562,17 @@ static void * ggml_backend_cpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
+#ifdef __linux__
+    {
+        std::lock_guard<std::mutex> lock(ggml_cpu_mapped_buffers_mutex);
+        const auto it = ggml_cpu_mapped_buffers.find(buffer->context);
+        if (it != ggml_cpu_mapped_buffers.end()) {
+            munmap(it->first, it->second);
+            ggml_cpu_mapped_buffers.erase(it);
+            return;
+        }
+    }
+#endif
     ggml_aligned_free(buffer->context, buffer->size);
 }
 
@@ -2595,7 +2652,13 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+    void * data = NULL;
+#ifdef __linux__
+    data = ggml_cpu_profile_buffer_alloc(size);
+#endif
+    if (data == NULL) {
+        data = ggml_aligned_malloc(size);
+    }
 
     if (data == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);

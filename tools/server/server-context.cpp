@@ -2093,7 +2093,9 @@ private:
             }
         }
 
-        if (llama_vocab_is_eog(vocab, result.tok)) {
+        const bool teacher_sequence_remaining =
+                slot.stats.n_gen < slot.task->params.teacher_forced_tokens.size();
+        if (llama_vocab_is_eog(vocab, result.tok) && !teacher_sequence_remaining) {
             slot.stop           = STOP_TYPE_EOS;
             slot.has_next_token = false;
 
@@ -4357,8 +4359,24 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
+            const size_t teacher_index = slot.stats.n_gen;
+            const llama_token teacher_token = teacher_index < slot.task->params.teacher_forced_tokens.size()
+                    ? slot.task->params.teacher_forced_tokens[teacher_index]
+                    : -1;
             llama_token id;
-            {
+            float teacher_forced_prob = -1.0f;
+            if (teacher_token >= 0) {
+                const auto probabilities = get_token_probabilities(slot.ctx_tgt, tok_idx, 0);
+                for (const auto & candidate : probabilities) {
+                    if (candidate.id == teacher_token) {
+                        teacher_forced_prob = candidate.p;
+                        break;
+                    }
+                }
+            }
+            if (teacher_token >= 0) {
+                id = teacher_token;
+            } else {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
@@ -4387,6 +4405,9 @@ private:
 
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+            }
+            if (teacher_forced_prob >= 0.0f) {
+                result.prob = teacher_forced_prob;
             }
 
             if (!process_token(result, slot)) {
